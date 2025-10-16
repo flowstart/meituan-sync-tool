@@ -843,10 +843,15 @@ dialog::backdrop {
 }
 
 /* ==================== 全局配置页面 ==================== */
+#page-config {
+    overflow-y: auto;
+}
+
 .config-page {
     max-width: 800px;
     margin: 0 auto;
     padding: 24px;
+    min-height: 100%;
 }
 
 .config-header {
@@ -936,6 +941,7 @@ dialog::backdrop {
 
 .config-actions {
     margin-top: 32px;
+    margin-bottom: 20px;
     padding-top: 24px;
     border-top: 1px solid #f0f0f0;
     text-align: right;

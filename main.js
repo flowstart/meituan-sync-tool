@@ -138,9 +138,16 @@ function initializeServices() {
  * 应用启动
  */
 app.whenReady().then(() => {
+    // 设置日志目录到用户数据目录（打包后可写）
+    const userDataPath = app.getPath('userData');
+    const logsPath = path.join(userDataPath, 'logs');
+    logger.setLogDir(logsPath);
+    
     logger.info('='.repeat(60));
     logger.info('美团同步工具启动中...');
     logger.info('架构：Electron + 同步引擎（无Python后端）');
+    logger.info(`用户数据目录: ${userDataPath}`);
+    logger.info(`日志目录: ${logsPath}`);
     logger.info('='.repeat(60));
 
     try {

@@ -21,10 +21,33 @@ class Logger {
             error: 3
         };
 
-        // 确保日志目录存在
-        if (this.enableFile && !fs.existsSync(this.logDir)) {
-            fs.mkdirSync(this.logDir, { recursive: true });
+        // 确保日志目录存在（捕获错误，避免打包后无法创建目录导致崩溃）
+        this._ensureLogDir();
+    }
+
+    /**
+     * 确保日志目录存在
+     */
+    _ensureLogDir() {
+        if (!this.enableFile) return;
+        
+        try {
+            if (!fs.existsSync(this.logDir)) {
+                fs.mkdirSync(this.logDir, { recursive: true });
+            }
+        } catch (error) {
+            console.warn('无法创建日志目录:', error.message);
+            // 如果创建失败，禁用文件日志
+            this.enableFile = false;
         }
+    }
+
+    /**
+     * 设置日志目录（用于在 app ready 后重新设置）
+     */
+    setLogDir(logDir) {
+        this.logDir = logDir;
+        this._ensureLogDir();
     }
 
     /**
