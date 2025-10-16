@@ -550,16 +550,5 @@ ipcMain.on('log', (event, level, ...args) => {
     }
 });
 
-// 取消正在运行的同步
-ipcMain.handle('cancel-sync', (event, { groupId }) => {
-    try {
-        const res = syncManager.cancel(groupId);
-        return res;
-    } catch (e) {
-        logger.error('取消同步失败:', e);
-        return { success: false, error: e.message };
-    }
-});
-
 logger.info('主进程初始化完成');
 logger.info('IPC事件处理器已注册');

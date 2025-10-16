@@ -28,3 +28,4 @@ monitor-test.sh
 # Temporary files
 *.tmp
 *.temp
+*.md
