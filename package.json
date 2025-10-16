@@ -6,7 +6,8 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "build": "electron-builder --win --x64"
+    "build": "electron-builder --win --x64",
+    "build:mac": "electron-builder --mac --x64"
   },
   "keywords": [
     "meituan",
@@ -34,6 +35,10 @@
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.productivity"
     },
     "extraResources": [
       {
