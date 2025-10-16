@@ -1,0 +1,30 @@
+# Node modules
+node_modules/
+
+# Build output
+dist/
+
+# Logs
+logs/
+*.log
+
+# Database files
+data/*.db
+data/*.xlsx
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Test files
+test-*.js
+test-output.log
+monitor-test.sh
+
+# Temporary files
+*.tmp
+*.temp

@@ -1,0 +1,1486 @@
+// 美团同步工具 - 前端逻辑
+// 使用Electron IPC通信
+
+const { ipcRenderer } = require('electron');
+
+// 全局状态
+let groups = [];
+let logs = {}; // {group_id: [logs]}
+let currentEditingGroupId = null; // 正在编辑的组ID
+let currentCookieConfig = null; // 当前Cookie配置 {groupId, type: 'eleme'/'qnh'}
+let globalConfig = {
+    incrementalInterval: 10,
+    batchConcurrency: 3,
+    debugMode: false,
+    cookiesCheckInterval: 24
+};
+// 运行状态缓存：避免重新渲染时丢失同步状态与按钮隐藏
+// 结构: { [groupId]: { syncing: boolean, type: 'full'|'incremental', progress?: number, message?: string } }
+let runningStates = {};
+// 定时任务状态 { [groupId]: boolean }
+let scheduledTasksActive = {};
+
+// ==================== 初始化 ====================
+
+document.addEventListener('DOMContentLoaded', () => {
+    console.log('🚀 前端初始化...');
+
+    // 初始化IPC监听
+    initIPCListeners();
+
+    // 初始化UI事件
+    initUIEvents();
+
+    // 加载全局配置
+    loadConfig();
+
+    // 加载同步组数据
+    loadGroups();
+});
+
+// ==================== IPC监听 ====================
+
+function initIPCListeners() {
+    console.log('🔌 初始化IPC监听...');
+
+    // 监听实时日志
+    ipcRenderer.on('sync-log', (event, logEntry) => {
+        console.log('[日志推送]', logEntry);
+        addLog(logEntry.groupId, logEntry.level, logEntry.message);
+    });
+
+    // 监听同步进度
+    ipcRenderer.on('sync-progress', (event, { groupId, progress, message }) => {
+        // 更新运行状态缓存，便于UI重新渲染后恢复进度条
+        if (!runningStates[groupId]) {
+            runningStates[groupId] = { syncing: true, type: 'incremental', progress: 0, message: '' };
+        }
+        runningStates[groupId].progress = progress;
+        runningStates[groupId].message = message;
+        updateProgress(groupId, progress, message);
+    });
+
+    // 同步开始/结束
+    ipcRenderer.on('sync-started', (event, { groupId, type }) => {
+        setGroupSyncState(groupId, true, type);
+    });
+    ipcRenderer.on('sync-finished', (event, { groupId }) => {
+        setGroupSyncState(groupId, false);
+    });
+
+    // 监听同步完成事件
+    ipcRenderer.on('sync-complete', (event, { groupId, result }) => {
+        // 特殊提示：需要先全量
+        if (result && result.status === 'failed' && result.error === 'require_full_sync_first') {
+            alert('⚠️ 请先执行一次全量同步，再开启增量同步。');
+        }
+        handleSyncComplete(groupId, result);
+    });
+
+    // 监听定时任务状态变化
+    ipcRenderer.on('scheduled-task-changed', (event, data) => {
+        console.log('[定时任务状态变化]', data);
+        scheduledTasksActive[data.groupId] = data.action === 'start';
+        updateScheduledTaskStatus(data.groupId, data.action);
+        const state = runningStates[data.groupId];
+        const isRunning = state && state.syncing;
+        setIndeterminateProgress(data.groupId, scheduledTasksActive[data.groupId] && !isRunning);
+    });
+
+    // 监听cookies失效通知
+    ipcRenderer.on('cookies-invalid', (event, { groupId, type }) => {
+        handleCookiesInvalid(groupId, type);
+    });
+
+    updateConnectionStatus(true);
+    console.log('✅ IPC监听已初始化');
+}
+
+function updateConnectionStatus(connected) {
+    const statusDot = document.getElementById('connectionStatus');
+    const statusText = document.getElementById('connectionText');
+
+    if (connected) {
+        statusDot.className = 'status-dot';
+        statusText.textContent = '就绪';
+    } else {
+        statusDot.className = 'status-dot disconnected';
+        statusText.textContent = '未连接';
+    }
+}
+
+// ==================== IPC请求封装 ====================
+
+async function ipcRequest(channel, ...args) {
+    try {
+        console.log(`[IPC请求] ${channel}`, ...args);
+        const result = await ipcRenderer.invoke(channel, ...args);
+        console.log(`[IPC响应] ${channel}`, result);
+        return result;
+    } catch (error) {
+        console.error(`[IPC错误] ${channel}:`, error);
+        alert(`操作失败: ${error.message}`);
+        throw error;
+    }
+}
+
+// ==================== UI事件 ====================
+
+function initUIEvents() {
+    // 页面切换
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            const page = tab.dataset.page;
+            switchPage(page);
+        });
+    });
+
+    // 增加组按钮 - 直接创建，不弹窗
+    document.getElementById('addGroupBtn').addEventListener('click', createGroupDirectly);
+
+    // 全局配置按钮
+    document.getElementById('globalConfigBtn').addEventListener('click', async () => {
+        switchPage('config');
+        await loadConfigToForm();
+    });
+
+    // 刷新日志按钮
+    document.getElementById('refreshLogsBtn').addEventListener('click', () => {
+        renderLogs();
+    });
+
+    // 清空所有日志按钮
+    document.getElementById('clearAllLogsBtn').addEventListener('click', () => {
+        logs = {};
+        renderLogs();
+    });
+
+    // 整店校准按钮
+    document.getElementById('startCalibrationBtn').addEventListener('click', () => {
+        startCalibration();
+    });
+
+    document.getElementById('cancelCalibrationBtn').addEventListener('click', () => {
+        switchPage('work');
+    });
+}
+
+function switchPage(pageName) {
+    // 切换标签页
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.page === pageName);
+    });
+
+    // 切换页面
+    document.querySelectorAll('.page').forEach(page => {
+        page.classList.toggle('active', page.id === `page-${pageName}`);
+    });
+
+    // 加载对应数据
+    if (pageName === 'calibration') {
+        renderCalibrationPage();
+    }
+}
+
+// ==================== 组管理 ====================
+
+async function loadGroups() {
+    try {
+        console.log('📦 加载同步组...');
+        groups = await ipcRequest('get-all-groups');
+        console.log('获取到组:', groups);
+        renderGroups();
+        // 初始化定时任务状态
+        try {
+            const tasks = await ipcRequest('get-scheduled-tasks');
+            scheduledTasksActive = {};
+            if (Array.isArray(tasks)) {
+                for (const t of tasks) {
+                    scheduledTasksActive[t.groupId] = !!t.isActive;
+                }
+            }
+            for (const g of groups) {
+                const isActive = !!scheduledTasksActive[g.id];
+                const isRunning = runningStates[g.id] && runningStates[g.id].syncing;
+                setIndeterminateProgress(g.id, isActive && !isRunning);
+            }
+        } catch (e) {
+            console.warn('获取定时任务状态失败:', e);
+        }
+        renderCalibrationPage();
+    } catch (error) {
+        console.error('加载组失败:', error);
+        document.getElementById('groupsContainer').innerHTML = `
+            <div class="loading-placeholder">
+                <div style="color: #ff4d4f;">❌ 加载失败</div>
+                <div style="font-size: 12px; margin-top: 8px;">${error.message}</div>
+                <button onclick="loadGroups()" style="margin-top: 12px; padding: 8px 16px;">重试</button>
+            </div>
+        `;
+    }
+}
+
+/**
+ * 检查组是否可以同步
+ * @param {Object} group - 组对象
+ * @returns {boolean} 是否可以同步
+ */
+function canSync(group) {
+    // 检查饿了么cookies是否配置
+    const hasElemeCookies = group.eleme_cookies && group.eleme_cookies.trim() !== '';
+    
+    // 检查牵牛花cookies是否配置
+    const hasQnhCookies = group.qnh_cookies && group.qnh_cookies.trim() !== '';
+    
+    // 检查牵牛花门店是否选择
+    const hasQnhStore = group.qnh_store_id && group.qnh_store_id.trim() !== '';
+    
+    // 只有三个条件都满足才可以同步
+    return hasElemeCookies && hasQnhCookies && hasQnhStore;
+}
+
+function renderGroups() {
+    const container = document.getElementById('groupsContainer');
+
+    if (groups.length === 0) {
+        container.innerHTML = `
+            <div class="loading-placeholder">
+                <div>暂无同步组</div>
+                <div style="font-size: 12px; margin-top: 8px; color: #8c8c8c;">
+                    点击「➕ 增加组」添加第一个同步组
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = groups.map(group => {
+        // Cookie直接显示字符串（前50个字符）
+        const elemeCookieDisplay = group.eleme_cookies && group.eleme_cookies.trim()
+            ? group.eleme_cookies.substring(0, 50) + '...'
+            : '点击配置Cookie';
+
+        const qnhCookieDisplay = group.qnh_cookies && group.qnh_cookies.trim()
+            ? group.qnh_cookies.substring(0, 50) + '...'
+            : '点击配置Cookie';
+
+        // 显示门店信息
+        const elemeStoreInfo = group.eleme_store_name
+            ? `📍 店铺名称: ${group.eleme_store_name}`
+            : (group.eleme_cookies && group.eleme_cookies.trim()
+                ? '<span style="color: #faad14;">请重新配置Cookie以获取门店信息</span>'
+                : '<span style="color: #8c8c8c;">未配置</span>');
+
+        // 牵牛花门店下拉框和刷新按钮
+        const qnhStoreList = window.qnhStores && window.qnhStores[group.id] ? window.qnhStores[group.id] : [];
+        let qnhStoreSelect = '';
+        let qnhRefreshBtn = '';
+
+        if (qnhStoreList.length > 0 || (group.qnh_store_id && group.qnh_store_name)) {
+            // 如果有门店列表或已选择门店，显示下拉框
+            if (qnhStoreList.length === 0 && group.qnh_store_id && group.qnh_store_name) {
+                // 重新打开软件，只有已选择的门店，需要构建列表
+                qnhStoreList.push({
+                    id: group.qnh_store_id,
+                    name: group.qnh_store_name
+                });
+                // 同时保存到全局变量
+                if (!window.qnhStores) {
+                    window.qnhStores = {};
+                }
+                window.qnhStores[group.id] = qnhStoreList;
+            }
+            
+            qnhStoreSelect = `
+                <select class="config-select" onchange="selectQnhStore(${group.id}, this.value)" style="flex: 1;">
+                    <option value="">请选择门店...</option>
+                    ${qnhStoreList.map(store => `
+                        <option value="${store.id}" ${store.id === group.qnh_store_id ? 'selected' : ''}>
+                            ${store.name}（${store.id}）
+                        </option>
+                    `).join('')}
+                </select>
+                <button class="refresh-btn" onclick="refreshQnhStores(${group.id})" title="刷新门店列表">
+                    🔄
+                </button>
+            `;
+        } else if (group.qnh_cookies && group.qnh_cookies.trim()) {
+            // 有Cookie但未获取门店列表
+            qnhStoreSelect = `
+                <input type="text" class="config-input" value="请先获取门店列表" readonly disabled style="flex: 1;">
+                <button class="refresh-btn" onclick="refreshQnhStores(${group.id})" title="获取门店列表">
+                    🔄
+                </button>
+            `;
+        } else {
+            // 未配置Cookie
+            qnhStoreSelect = `<input type="text" class="config-input" value="请先配置Cookie" readonly disabled style="flex: 1;">`;
+        }
+
+        const isSyncing = !!(runningStates[group.id] && runningStates[group.id].syncing);
+        const isScheduled = !!scheduledTasksActive[group.id];
+        const syncingType = isSyncing ? (runningStates[group.id].type || '') : '';
+        // 同步信息（从最近历史中获取）
+        const fullInfo = group.last_full_sync_time && group.last_full_sync_count >= 0
+            ? `✅ 全量: ${formatBeijingTime(group.last_full_sync_time)} | ${group.last_full_sync_count}个商品`
+            : '';
+        const incrInfo = group.last_incr_sync_time && group.last_incr_sync_count >= 0
+            ? `🔄 增量: ${formatBeijingTime(group.last_incr_sync_time)} | ${group.last_incr_sync_count}个商品`
+            : '';
+
+        return `
+        <div class="group-card${isSyncing ? ' syncing' : ''}" data-group-id="${group.id}">
+            <div class="group-header">
+                <div class="group-name">
+                    🔷 ${group.name}
+                    <span class="group-status">${isSyncing ? (syncingType === 'full' ? '🔄 全量同步中' : '▶️ 增量同步中') : '⏹️ 待机'}</span>
+                </div>
+                <div class="group-tools">
+                    <button class="tool-btn" title="复制该组" onclick="duplicateGroup(${group.id})">📄 复制</button>
+                    <button class="tool-btn" title="编辑组名" onclick="editGroup(${group.id})">✏️ 编辑</button>
+                    <button class="tool-btn danger" title="删除该组" onclick="deleteGroup(${group.id})">🗑️ 删除</button>
+                </div>
+            </div>
+
+            <div class="group-content">
+                <!-- 饿了么配置 -->
+                <div class="config-row">
+                    <div class="config-label">饿了么:</div>
+                    <input type="text" class="config-input" value="${elemeCookieDisplay}"
+                           readonly onclick="openCookieDialog(${group.id}, 'eleme')"
+                           title="点击配置Cookie">
+                </div>
+                <div class="store-info">${elemeStoreInfo}</div>
+
+                <!-- 箭头 -->
+                <div style="text-align: center; margin: 10px 0;">
+                    <span class="arrow">⬇️</span>
+                </div>
+
+                <!-- 牵牛花配置 -->
+                <div class="config-row">
+                    <div class="config-label">牵牛花:</div>
+                    <input type="text" class="config-input" value="${qnhCookieDisplay}"
+                           readonly onclick="openCookieDialog(${group.id}, 'qnh')"
+                           title="点击配置Cookie">
+                </div>
+                <div class="config-row">
+                    <div class="config-label">门店:</div>
+                    <div style="display: flex; gap: 8px; flex: 1;">
+                        ${qnhStoreSelect}
+                    </div>
+                </div>
+            </div>
+
+            <div class="group-actions">
+                <button class="action-btn primary btn-incremental" 
+                        onclick="startIncrementalSync(${group.id})"
+                        ${!canSync(group) || isSyncing || isScheduled ? 'disabled title=\"请先完成饿了么Cookie、牵牛花Cookie和门店配置\"' : ''}
+                        style="${isSyncing || isScheduled ? 'display:none;' : ''}">
+                    ▶️ 增量同步
+                </button>
+                <button class="action-btn success btn-full" 
+                        onclick="startFullSync(${group.id})"
+                        ${!canSync(group) || isSyncing ? 'disabled title=\"请先完成饿了么Cookie、牵牛花Cookie和门店配置\"' : ''}
+                        style="${isSyncing ? 'display:none;' : ''}">
+                    🔄 全量同步
+                </button>
+                <button class="action-btn warning btn-cancel" style="${(isSyncing || isScheduled) ? '' : 'display:none;'}" onclick="cancelSync(${group.id})">
+                    ⏸️ 暂停/停止
+                </button>
+            </div>
+            <div class="sync-info">
+                ${fullInfo ? `<div class="sync-record">${fullInfo}</div>` : ''}
+                ${incrInfo ? `<div class="sync-record">${incrInfo}</div>` : ''}
+            </div>
+        </div>
+        `;
+    }).join('');
+
+    // 渲染后恢复正在同步的进度条
+    for (const [gid, state] of Object.entries(runningStates)) {
+        if (state.syncing) {
+            updateProgress(parseInt(gid), state.progress ?? 0, state.message ?? '');
+        }
+    }
+}
+
+function formatBeijingTime(dateStr) {
+    if (!dateStr) return '';
+    const d = new Date(dateStr);
+    const beijingOffset = 8 * 60;
+    const localOffset = d.getTimezoneOffset();
+    const bj = new Date(d.getTime() + (beijingOffset + localOffset) * 60000);
+    const y = bj.getFullYear();
+    const m = String(bj.getMonth() + 1).padStart(2, '0');
+    const day = String(bj.getDate()).padStart(2, '0');
+    const hh = String(bj.getHours()).padStart(2, '0');
+    const mm = String(bj.getMinutes()).padStart(2, '0');
+    return `${y}-${m}-${day} ${hh}:${mm}`;
+}
+
+// ==================== 同步操作 ====================
+
+async function startIncrementalSync(groupId) {
+    try {
+        console.log('开始增量同步:', groupId);
+
+        // 清空该组的日志
+        logs[groupId] = [];
+        renderLogs();
+
+        // 进入待机态：显示无限进度条、隐藏开始按钮，仅显示暂停按钮
+        setIndeterminateProgress(groupId, true);
+
+        // 直接开启定时任务（符合预期：点击增量即开启持续循环）
+        await ipcRequest('start-scheduled-sync', {
+            groupId,
+            intervalMinutes: globalConfig.incrementalInterval
+        });
+        console.log('定时增量同步已启动');
+    } catch (error) {
+        console.error('启动增量同步失败:', error);
+    }
+}
+
+async function startFullSync(groupId) {
+    // 显示三选项确认框
+    showFullSyncDialog(groupId);
+}
+
+function showFullSyncDialog(groupId) {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'dialog';
+    dialog.id = 'fullSyncDialog';
+    dialog.innerHTML = `
+        <div class="dialog-header">
+            <h3>🔄 全量同步确认</h3>
+            <button class="dialog-close" onclick="closeFullSyncDialog()">✕</button>
+        </div>
+        <div class="dialog-content">
+            <p style="margin-bottom: 12px;">全量同步会导出所有商品并更新库存，耗时较长（5-15分钟）。</p>
+            <p style="font-weight: bold;">请选择操作：</p>
+        </div>
+        <div class="dialog-footer">
+            <button class="btn btn-secondary" onclick="closeFullSyncDialog()">
+                取消
+            </button>
+            <button class="btn btn-primary" onclick="doFullSync(${groupId}, false)">
+                仅全量同步
+            </button>
+            <button class="btn btn-success" onclick="doFullSync(${groupId}, true)">
+                全量同步并开启增量
+            </button>
+        </div>
+    `;
+    
+    document.body.appendChild(dialog);
+    dialog.showModal();
+}
+
+function closeFullSyncDialog() {
+    const dialog = document.getElementById('fullSyncDialog');
+    if (dialog) {
+        dialog.close();
+        dialog.remove();
+    }
+}
+
+async function doFullSync(groupId, startIncremental) {
+    try {
+        closeFullSyncDialog();
+        
+        console.log('开始全量同步:', groupId, '自动开启增量:', startIncremental);
+
+        // 清空该组的日志
+        logs[groupId] = [];
+        renderLogs();
+
+        await ipcRequest('sync-group', {
+            groupId,
+            syncType: 'full'
+        });
+
+        // 如果选择了自动开启增量，则启动定时任务
+        if (startIncremental) {
+            await ipcRequest('start-scheduled-sync', {
+                groupId,
+                intervalMinutes: globalConfig.incrementalInterval,
+                runImmediately: false // 首次延迟执行：避免全量完成后立刻跑增量
+            });
+            console.log('定时增量同步已启动（首次延迟执行）');
+        }
+        
+        console.log('全量同步已启动');
+    } catch (error) {
+        console.error('启动全量同步失败:', error);
+    }
+}
+
+function editGroup(groupId) {
+    openEditGroupDialog(groupId);
+}
+
+async function deleteGroup(groupId) {
+    try {
+        const confirmed = confirm('确定要删除这个同步组吗？所有相关数据都将被删除。');
+        if (!confirmed) return;
+
+        await ipcRequest('delete-group', groupId);
+
+        console.log('删除成功');
+        loadGroups();
+    } catch (error) {
+        console.error('删除组失败:', error);
+    }
+}
+
+async function duplicateGroup(groupId) {
+    try {
+        const group = groups.find(g => g.id === groupId);
+        if (!group) return;
+
+        // 生成建议的新组名：在原名后添加“（副本）”，避免重名
+        let newName = `${group.name}（副本）`;
+        // 若有重名，则追加数字
+        let suffix = 2;
+        while (groups.some(g => g.name === newName)) {
+            newName = `${group.name}（副本${suffix}）`;
+            suffix += 1;
+        }
+
+        const res = await ipcRequest('duplicate-group', { groupId, newName });
+        if (res && res.success) {
+            console.log('复制成功，新组ID:', res.groupId);
+            await loadGroups();
+            alert('✅ 已复制同步组，请为新组选择牵牛花门店');
+        } else {
+            alert('❌ 复制失败: ' + ((res && res.error) || '未知错误'));
+        }
+    } catch (e) {
+        console.error('复制组失败:', e);
+        alert('❌ 复制失败: ' + e.message);
+    }
+}
+
+// ==================== 日志管理 ====================
+
+function addLog(groupId, level, message) {
+    if (!logs[groupId]) {
+        logs[groupId] = [];
+    }
+
+    // 统一保存 ISO 时间戳，渲染时再转北京时区
+    const timestamp = new Date().toISOString();
+    logs[groupId].push({ timestamp, level, message });
+
+    // 限制日志数量（最多1000条）
+    if (logs[groupId].length > 1000) {
+        logs[groupId].shift();
+    }
+
+    renderLogs();
+}
+
+function renderLogs() {
+    const container = document.getElementById('logsContainer');
+
+    // 无组时展示占位
+    if (!groups || groups.length === 0) {
+        container.innerHTML = `
+            <div class="no-logs">
+                <p>暂无日志</p>
+                <p style="font-size: 12px; color: #8c8c8c;">开始同步后将显示实时日志</p>
+            </div>
+        `;
+        return;
+    }
+
+    // 日志面板顺序：与左侧组列表一致（新在上、老在下），确保左右对应
+    const orderedGroups = groups.slice();
+
+    container.innerHTML = orderedGroups.map(group => {
+        const groupId = group.id;
+        const groupName = group.name || `组 ${groupId}`;
+        const logList = logs[groupId] || [];
+
+        const contentHtml = logList.length > 0
+            ? logList.map(log => {
+                const bj = formatBeijingTime(log.timestamp);
+                return `
+                    <div class="log-line">
+                        <span class="log-time">${bj}</span> |
+                        <span class="log-level-${log.level}">${log.level.toUpperCase()}</span> |
+                        ${log.message}
+                    </div>
+                `;
+            }).join('')
+            : `
+                <div class="log-line" style="color: #8c8c8c;">
+                    暂无日志，开始同步后将在此显示
+                </div>
+            `;
+
+        return `
+            <div class="log-card">
+                <div class="log-header">
+                    <div class="log-title">📋 ${groupName}</div>
+                    <div class="log-actions">
+                        <button class="log-btn" onclick="clearGroupLogs(${groupId})">清空</button>
+                        <button class="log-btn" onclick="exportGroupLogs(${groupId})">导出</button>
+                    </div>
+                </div>
+                <div class="log-content">
+                    ${contentHtml}
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    // 自动滚动到每个日志卡片的底部
+    const logCards = container.querySelectorAll('.log-content');
+    logCards.forEach(card => {
+        card.scrollTop = card.scrollHeight;
+    });
+}
+
+function clearGroupLogs(groupId) {
+    logs[groupId] = [];
+    renderLogs();
+}
+
+function exportGroupLogs(groupId) {
+    alert(`导出组 ${groupId} 日志功能开发中...`);
+    // TODO: 导出日志到文件
+}
+
+// ==================== 整店校准 ====================
+
+function renderCalibrationPage() {
+    const container = document.getElementById('calibrationGroups');
+
+    if (groups.length === 0) {
+        container.innerHTML = `
+            <div class="loading-placeholder">
+                <div>暂无可用的同步组</div>
+                <div style="font-size: 12px; margin-top: 8px; color: #8c8c8c;">
+                    请先在「工作状态」页面添加同步组
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = groups.map(group => {
+        const isSyncing = !!(runningStates[group.id] && runningStates[group.id].syncing);
+        const okBase = canSync(group);
+        const valid = !!group.eleme_cookies_valid && !!group.qnh_cookies_valid;
+        const selectable = okBase && valid && !isSyncing;
+        let reason = '';
+        if (!okBase) {
+            reason = '请先完成饿了么Cookie、牵牛花Cookie与门店配置';
+        } else if (!valid) {
+            reason = 'Cookies已过期或无效，请重新验证配置';
+        } else if (isSyncing) {
+            reason = '该组正在执行同步任务，无法选择';
+        }
+        const statusText = isSyncing ? '🔄 同步中' : (!valid ? '⚠️ Cookies无效' : '⏹️ 待机');
+
+        return `
+        <div class="calibration-group">
+            <input type="checkbox" class="calibration-checkbox" data-group-id="${group.id}" ${selectable ? '' : 'disabled'} title="${reason}">
+            <label style="flex: 1; cursor: pointer;">
+                <strong>${group.name}</strong><br>
+                <small style="color: #8c8c8c;">
+                    饿了么店铺 ${group.eleme_store_id || '-'} → 牵牛花门店 ${group.qnh_store_id || '-'}
+                </small>
+            </label>
+            <span class="group-status">${statusText}</span>
+        </div>
+        `;
+    }).join('');
+
+    // 更新选中计数
+    updateCalibrationCount();
+
+    // 绑定checkbox事件
+    document.querySelectorAll('.calibration-checkbox').forEach(checkbox => {
+        checkbox.addEventListener('change', updateCalibrationCount);
+    });
+}
+
+function updateCalibrationCount() {
+    const checked = document.querySelectorAll('.calibration-checkbox:checked');
+    const btn = document.getElementById('startCalibrationBtn');
+    btn.textContent = `🚀 开始校准选中的组 (${checked.length})`;
+    btn.disabled = checked.length === 0;
+}
+
+async function startCalibration() {
+    const checked = document.querySelectorAll('.calibration-checkbox:checked');
+    const groupIds = Array.from(checked).map(cb => parseInt(cb.dataset.groupId));
+
+    if (groupIds.length === 0) {
+        alert('请至少选择一个可校准的组');
+        return;
+    }
+
+    // 直接切换回工作状态页并并行启动全量同步（不再弹确认框）
+    switchPage('work');
+
+    try {
+        await ipcRequest('sync-multiple-groups', {
+            groupIds,
+            syncType: 'full',
+            concurrency: globalConfig.batchConcurrency,
+            options: {}
+        });
+    } catch (e) {
+        console.error('批量校准启动失败', e);
+    }
+}
+
+// ==================== 对话框管理 ====================
+
+// 数字转中文（一、二、三...）
+function numberToChinese(num) {
+    const chinese = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+    if (num <= 10) {
+        return chinese[num - 1];
+    }
+    return num.toString();
+}
+
+// 获取默认组名（一组、二组、三组...）
+function getDefaultGroupName() {
+    const existingNumbers = groups
+        .map(g => g.name)
+        .filter(name => /^[一二三四五六七八九十]+组$/.test(name))
+        .map(name => {
+            const chineseNum = name.replace('组', '');
+            const chinese = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+            return chinese.indexOf(chineseNum) + 1;
+        });
+
+    let nextNum = 1;
+    while (existingNumbers.includes(nextNum)) {
+        nextNum++;
+    }
+
+    return `${numberToChinese(nextNum)}组`;
+}
+
+// ========== 直接创建组（不弹窗） ==========
+
+async function createGroupDirectly() {
+    try {
+        const name = getDefaultGroupName();
+
+        await ipcRequest('add-group', {
+            name: name,
+            elemeConfig: {
+                cookies: '',
+                seller_id: '',
+                store_id: ''
+            },
+            qnhConfig: {
+                cookies: '',
+                store_id: ''
+            }
+        });
+
+        loadGroups(); // 刷新组列表
+    } catch (error) {
+        console.error('创建组失败:', error);
+    }
+}
+
+// ========== 增加组对话框（已废弃，保留代码） ==========
+
+function openAddGroupDialog() {
+    const dialog = document.getElementById('addGroupDialog');
+    const input = document.getElementById('newGroupName');
+    input.value = getDefaultGroupName();
+    dialog.showModal();
+
+    // 自动选中输入框文本
+    setTimeout(() => input.select(), 0);
+}
+
+function closeAddGroupDialog() {
+    document.getElementById('addGroupDialog').close();
+}
+
+async function confirmAddGroup() {
+    const name = document.getElementById('newGroupName').value.trim();
+    if (!name) {
+        alert('请输入组名称');
+        return;
+    }
+
+    // 检查是否重名
+    if (groups.some(g => g.name === name)) {
+        alert('组名称已存在，请使用其他名称');
+        return;
+    }
+
+    try {
+        await ipcRequest('add-group', {
+            name: name,
+            elemeConfig: {
+                cookies: '',
+                seller_id: '',
+                store_id: ''
+            },
+            qnhConfig: {
+                cookies: '',
+                store_id: ''
+            }
+        });
+
+        // 不弹窗，直接关闭对话框并刷新
+        closeAddGroupDialog();
+        loadGroups(); // 刷新组列表
+    } catch (error) {
+        console.error('创建组失败:', error);
+    }
+}
+
+// ========== 编辑组名对话框 ==========
+
+function openEditGroupDialog(groupId) {
+    const group = groups.find(g => g.id === groupId);
+    if (!group) return;
+
+    currentEditingGroupId = groupId;
+    const dialog = document.getElementById('editGroupDialog');
+    const input = document.getElementById('editGroupName');
+    input.value = group.name;
+    dialog.showModal();
+
+    // 自动选中输入框文本
+    setTimeout(() => input.select(), 0);
+}
+
+function closeEditGroupDialog() {
+    document.getElementById('editGroupDialog').close();
+    currentEditingGroupId = null;
+}
+
+async function confirmEditGroup() {
+    const name = document.getElementById('editGroupName').value.trim();
+    if (!name) {
+        alert('请输入组名称');
+        return;
+    }
+
+    // 检查是否重名（排除自己）
+    if (groups.some(g => g.name === name && g.id !== currentEditingGroupId)) {
+        alert('组名称已存在，请使用其他名称');
+        return;
+    }
+
+    try {
+        await ipcRequest('update-group', {
+            groupId: currentEditingGroupId,
+            updates: { name: name }
+        });
+
+        console.log('✅ 修改成功');
+        // 保持运行状态不丢失：只更新groups数组中的名称，避免立即全量刷新导致按钮闪现
+        const idx = groups.findIndex(g => g.id === currentEditingGroupId);
+        if (idx !== -1) {
+            groups[idx].name = name;
+            renderGroups();
+        } else {
+            // 回退：若未找到，则全量刷新
+            loadGroups();
+        }
+        closeEditGroupDialog();
+    } catch (error) {
+        console.error('修改组名失败:', error);
+    }
+}
+
+// ========== Cookie配置对话框 ==========
+
+function openCookieDialog(groupId, type) {
+    const group = groups.find(g => g.id === groupId);
+    if (!group) return;
+
+    currentCookieConfig = { groupId, type };
+
+    const dialog = document.getElementById('cookieDialog');
+    const title = document.getElementById('cookieDialogTitle');
+    const label = document.getElementById('cookieDialogLabel');
+    const input = document.getElementById('cookieInput');
+
+    // 重置按钮状态（避免上次验证状态残留）
+    const saveBtn = dialog.querySelector('.btn-primary');
+    saveBtn.disabled = false;
+    saveBtn.textContent = '保存并验证';
+    saveBtn.style.opacity = '1';
+
+    // 设置对话框标题和标签
+    if (type === 'eleme') {
+        title.textContent = '🍪 配置饿了么Cookie';
+        label.textContent = '饿了么Cookie字符串：';
+        input.value = group.eleme_cookies || '';  // 直接显示字符串
+    } else {
+        title.textContent = '🍪 配置牵牛花Cookie';
+        label.textContent = '牵牛花Cookie字符串：';
+        input.value = group.qnh_cookies || '';  // 直接显示字符串
+    }
+
+    dialog.showModal();
+}
+
+function closeCookieDialog() {
+    document.getElementById('cookieDialog').close();
+    currentCookieConfig = null;
+}
+
+async function confirmCookie() {
+    const cookieValue = document.getElementById('cookieInput').value.trim();
+    if (!cookieValue) {
+        alert('请输入Cookie字符串');
+        return;
+    }
+
+    const { groupId, type } = currentCookieConfig;
+
+    // 显示Loading状态
+    const saveBtn = document.querySelector('#cookieDialog .btn-primary');
+    const originalBtnText = saveBtn.textContent;
+    saveBtn.disabled = true;
+    saveBtn.textContent = '验证中...';
+    saveBtn.style.opacity = '0.6';
+
+    try {
+        // 验证Cookie并获取门店信息
+        if (type === 'eleme') {
+            // 验证饿了么Cookie
+            const result = await ipcRequest('validate-eleme-cookies', {
+                groupId,
+                cookies: cookieValue
+            });
+
+            if (!result.success) {
+                // 根据错误类型显示不同提示
+                let errorMsg = `❌ Cookie验证失败：${result.error}`;
+                if (result.error && (result.error.includes('401') || result.error.includes('403') || result.error.includes('token') || result.error.includes('登录'))) {
+                    errorMsg += '\n\n请检查Cookie是否正确或已过期。';
+                }
+                alert(errorMsg);
+                
+                // 恢复按钮状态
+                saveBtn.disabled = false;
+                saveBtn.textContent = originalBtnText;
+                saveBtn.style.opacity = '1';
+                return;
+            }
+
+            console.log('✅ 饿了么Cookie验证成功:', result.storeName);
+            alert(`✅ 验证成功！\n门店: ${result.storeName}`);
+        } else {
+            // 验证牵牛华Cookie
+            const result = await ipcRequest('validate-qnh-cookies', {
+                groupId,
+                cookies: cookieValue
+            });
+
+            if (!result.success) {
+                // 根据错误类型显示不同提示
+                let errorMsg = `❌ Cookie验证失败：${result.error}`;
+                if (result.error && (result.error.includes('401') || result.error.includes('403') || result.error.includes('token') || result.error.includes('登录'))) {
+                    errorMsg += '\n\n请检查Cookie是否正确或已过期。';
+                }
+                alert(errorMsg);
+                
+                // 恢复按钮状态
+                saveBtn.disabled = false;
+                saveBtn.textContent = originalBtnText;
+                saveBtn.style.opacity = '1';
+                return;
+            }
+
+            // 存储门店列表到全局变量，供下拉框使用
+            if (!window.qnhStores) {
+                window.qnhStores = {};
+            }
+            window.qnhStores[groupId] = result.stores;
+
+            console.log('✅ 牵牛华Cookie验证成功，获取到', result.stores.length, '个门店');
+            alert(`✅ 验证成功！\n获取到 ${result.stores.length} 个门店，请选择门店`);
+        }
+
+        // 关闭对话框并刷新
+        closeCookieDialog();
+        loadGroups(); // 刷新组列表
+    } catch (error) {
+        console.error('保存Cookie失败:', error);
+        alert(`❌ 操作失败：${error.message}`);
+        
+        // 恢复按钮状态
+        saveBtn.disabled = false;
+        saveBtn.textContent = originalBtnText;
+        saveBtn.style.opacity = '1';
+    }
+}
+
+// ==================== 门店管理 ====================
+
+/**
+ * 选择牵牛花门店
+ */
+async function selectQnhStore(groupId, storeId) {
+    if (!storeId) return;
+
+    try {
+        const storeList = window.qnhStores[groupId];
+        const store = storeList.find(s => s.id === storeId);
+
+        if (!store) {
+            alert('未找到门店信息');
+            return;
+        }
+
+        // 保存到数据库
+        await ipcRequest('update-group', {
+            groupId,
+            updates: {
+                qnh_store_id: storeId,
+                qnh_store_name: store.name
+            }
+        });
+
+        console.log('✅ 牵牛花门店已选择:', store.name);
+        loadGroups(); // 刷新组列表
+    } catch (error) {
+        console.error('选择门店失败:', error);
+        alert(`❌ 选择门店失败：${error.message}`);
+    }
+}
+
+/**
+ * 刷新牵牛花门店列表
+ */
+async function refreshQnhStores(groupId) {
+    try {
+        const group = groups.find(g => g.id === groupId);
+        if (!group || !group.qnh_cookies) {
+            alert('请先配置牵牛花Cookie');
+            return;
+        }
+
+        // 显示Loading状态
+        const card = document.querySelector(`[data-group-id="${groupId}"]`);
+        const refreshBtn = card.querySelector('.refresh-btn');
+        if (refreshBtn) {
+            refreshBtn.disabled = true;
+            refreshBtn.textContent = '⏳';
+            refreshBtn.style.opacity = '0.6';
+        }
+
+        // 验证牵牛花Cookie并获取门店列表
+        const result = await ipcRequest('validate-qnh-cookies', {
+            groupId,
+            cookies: group.qnh_cookies
+        });
+
+        // 恢复按钮状态
+        if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = '🔄';
+            refreshBtn.style.opacity = '1';
+        }
+
+        if (!result.success) {
+            // 根据错误类型显示不同提示
+            let errorMsg = `❌ 获取门店列表失败：${result.error}`;
+            if (result.error && (result.error.includes('401') || result.error.includes('403') || result.error.includes('token') || result.error.includes('登录'))) {
+                errorMsg += '\n\n请检查Cookie是否正确或已过期。';
+            }
+            alert(errorMsg);
+            return;
+        }
+
+        // 存储门店列表到全局变量
+        if (!window.qnhStores) {
+            window.qnhStores = {};
+        }
+        window.qnhStores[groupId] = result.stores;
+
+        console.log('✅ 牵牛花门店列表已刷新，获取到', result.stores.length, '个门店');
+        loadGroups(); // 刷新组列表以显示下拉框
+    } catch (error) {
+        console.error('刷新门店列表失败:', error);
+        alert(`❌ 刷新门店列表失败：${error.message}`);
+        
+        // 恢复按钮状态
+        const card = document.querySelector(`[data-group-id="${groupId}"]`);
+        const refreshBtn = card.querySelector('.refresh-btn');
+        if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = '🔄';
+            refreshBtn.style.opacity = '1';
+        }
+    }
+}
+
+// ==================== 进度条更新 ====================
+
+function updateProgress(groupId, progress, message) {
+    const card = document.querySelector(`[data-group-id="${groupId}"]`);
+    if (!card) return;
+
+    let progressBar = card.querySelector('.progress-bar');
+    let progressFill = card.querySelector('.progress-fill');
+    let progressText = card.querySelector('.progress-text');
+
+    // 如果进度条不存在，创建它
+    if (!progressBar) {
+        const actionsDiv = card.querySelector('.group-actions');
+        progressBar = document.createElement('div');
+        progressBar.className = 'progress-bar';
+        progressBar.style.display = 'none';
+        progressBar.innerHTML = '<div class="progress-fill" style="width: 0%"></div>';
+        
+        progressText = document.createElement('div');
+        progressText.className = 'progress-text';
+        
+        actionsDiv.parentNode.insertBefore(progressBar, actionsDiv);
+        actionsDiv.parentNode.insertBefore(progressText, actionsDiv);
+        
+        progressFill = progressBar.querySelector('.progress-fill');
+    }
+
+    if (progress === 0) {
+        // 开始同步，显示进度条
+        progressBar.style.display = 'block';
+        progressBar.classList.remove('indeterminate');
+        progressFill.style.width = '0%';
+        card.classList.add('syncing');
+        // 切换按钮 - 隐藏开始按钮，显示暂停
+        toggleGroupButtons(card, true);
+        if (!runningStates[groupId]) runningStates[groupId] = {};
+        runningStates[groupId].syncing = true;
+    } else if (progress === 100) {
+        // 同步完成，隐藏进度条
+        progressFill.style.width = '100%';
+        setTimeout(() => {
+            progressBar.style.display = 'none';
+            card.classList.remove('syncing');
+            toggleGroupButtons(card, false);
+        }, 1000);
+        if (!runningStates[groupId]) runningStates[groupId] = {};
+        runningStates[groupId].syncing = false;
+        runningStates[groupId].progress = 100;
+        runningStates[groupId].message = message || '';
+    } else if (progress === -1) {
+        // 同步失败，显示错误状态
+        progressBar.style.display = 'none';
+        card.classList.remove('syncing');
+        card.classList.add('error');
+        toggleGroupButtons(card, false);
+        setTimeout(() => card.classList.remove('error'), 3000);
+        if (!runningStates[groupId]) runningStates[groupId] = {};
+        runningStates[groupId].syncing = false;
+        runningStates[groupId].progress = -1;
+        runningStates[groupId].message = message || '';
+    } else {
+        // 更新进度
+        progressBar.classList.remove('indeterminate');
+        progressFill.style.width = Math.min(100, Math.max(0, progress)) + '%';
+        if (!runningStates[groupId]) runningStates[groupId] = {};
+        runningStates[groupId].progress = progress;
+        runningStates[groupId].message = message || '';
+    }
+
+    if (progressText && message) {
+        progressText.textContent = message;
+    }
+}
+
+// 在等待定时任务触发时显示无限进度条
+function setIndeterminateProgress(groupId, show) {
+    const card = document.querySelector(`[data-group-id="${groupId}"]`);
+    if (!card) return;
+    let progressBar = card.querySelector('.progress-bar');
+    let progressFill = card.querySelector('.progress-fill');
+    if (!progressBar) {
+        const actionsDiv = card.querySelector('.group-actions');
+        progressBar = document.createElement('div');
+        progressBar.className = 'progress-bar';
+        progressBar.style.display = 'none';
+        progressBar.innerHTML = '<div class="progress-fill" style="width: 0%"></div>';
+        actionsDiv.parentNode.insertBefore(progressBar, actionsDiv);
+        progressFill = progressBar.querySelector('.progress-fill');
+    }
+    if (show) {
+        progressBar.style.display = 'block';
+        progressBar.classList.add('indeterminate');
+        progressFill.style.width = '30%';
+        card.classList.add('syncing');
+        toggleGroupButtons(card, true);
+    } else {
+        progressBar.classList.remove('indeterminate');
+        progressBar.style.display = 'none';
+        card.classList.remove('syncing');
+        toggleGroupButtons(card, false);
+        // 停止定时后，恢复按钮可用状态
+        updateGroupButtonsEnabled(groupId);
+    }
+}
+
+function toggleGroupButtons(card, syncing) {
+    const btnIncr = card.querySelector('.btn-incremental');
+    const btnFull = card.querySelector('.btn-full');
+    const btnCancel = card.querySelector('.btn-cancel');
+    if (btnIncr && btnFull && btnCancel) {
+        btnIncr.style.display = syncing ? 'none' : 'inline-block';
+        btnFull.style.display = syncing ? 'none' : 'inline-block';
+        btnCancel.style.display = syncing ? 'inline-block' : 'none';
+    }
+}
+
+function setGroupSyncState(groupId, syncing, type = '') {
+    const card = document.querySelector(`[data-group-id="${groupId}"]`);
+    if (!card) return;
+    const statusEl = card.querySelector('.group-status');
+    if (syncing) {
+        statusEl.textContent = type === 'full' ? '🔄 全量同步中' : '▶️ 增量同步中';
+        toggleGroupButtons(card, true);
+        if (!runningStates[groupId]) runningStates[groupId] = {};
+        runningStates[groupId].syncing = true;
+        runningStates[groupId].type = type || runningStates[groupId].type || '';
+    } else {
+        statusEl.textContent = '⏹️ 待机';
+        // 同步结束（成功/失败/取消），按钮应可再次点击
+        toggleGroupButtons(card, false);
+        // 隐藏进度条
+        const bar = card.querySelector('.progress-bar');
+        if (bar) bar.style.display = 'none';
+        if (!runningStates[groupId]) runningStates[groupId] = {};
+        runningStates[groupId].syncing = false;
+        // 清除同步类型，避免残留影响渲染
+        delete runningStates[groupId].type;
+        // 恢复可点击状态（考虑定时状态与配置完整性）
+        updateGroupButtonsEnabled(groupId);
+    }
+}
+
+async function cancelSync(groupId) {
+    try {
+        const confirmed = confirm('确定要暂停并终止当前同步任务吗？\n已进行的操作将不会回滚。');
+        if (!confirmed) return;
+
+        const res = await ipcRequest('cancel-sync', { groupId });
+        if (res && res.success) {
+            // 若是停止定时任务，立即更新UI为待机但保留“定时开启”提示
+            if (res.action === 'stop_scheduled') {
+                setGroupSyncState(groupId, false);
+                // 定时任务状态会通过 scheduled-task-changed 事件再次同步，这里快速反馈
+                updateScheduledTaskStatus(groupId, 'stop');
+                scheduledTasksActive[groupId] = false;
+                updateGroupButtonsEnabled(groupId);
+            }
+        } else {
+            alert('终止任务失败: ' + ((res && res.error) || '未知错误'));
+        }
+    } catch (e) {
+        console.error('取消同步失败', e);
+    }
+}
+
+// ==================== 同步完成事件处理 ====================
+
+function handleSyncComplete(groupId, result) {
+    console.log('[同步完成]', groupId, result);
+    
+    // 重新加载组数据以显示更新后的同步信息
+    loadGroups();
+}
+
+// ==================== 定时任务状态更新 ====================
+
+function updateScheduledTaskStatus(groupId, action) {
+    console.log(`[定时任务] 组${groupId}: ${action}`);
+    const card = document.querySelector(`[data-group-id="${groupId}"]`);
+    if (!card) return;
+    const bar = card.querySelector('.progress-bar');
+    const state = runningStates[groupId];
+    const isRunning = state && state.syncing;
+    const isActive = action === 'start';
+    // 更新本地状态，便于按钮可用性判断
+    scheduledTasksActive[groupId] = isActive;
+    setIndeterminateProgress(groupId, isActive && !isRunning);
+    // 同步按钮可用性
+    updateGroupButtonsEnabled(groupId);
+}
+
+// 根据当前配置/运行/定时状态，启用或禁用按钮
+function updateGroupButtonsEnabled(groupId) {
+    const group = groups.find(g => g.id === groupId);
+    const card = document.querySelector(`[data-group-id="${groupId}"]`);
+    if (!group || !card) return;
+    const btnIncr = card.querySelector('.btn-incremental');
+    const btnFull = card.querySelector('.btn-full');
+    const isRunning = !!(runningStates[groupId] && runningStates[groupId].syncing);
+    const isScheduled = !!scheduledTasksActive[groupId];
+    const ok = canSync(group);
+    if (btnIncr) {
+        btnIncr.disabled = !ok || isRunning || isScheduled;
+        btnIncr.title = btnIncr.disabled ? '请先完成饿了么Cookie、牵牛花Cookie和门店配置，且未在定时中' : '';
+    }
+    if (btnFull) {
+        btnFull.disabled = !ok || isRunning; // 全量与定时并不冲突，但运行中需要禁用
+        btnFull.title = btnFull.disabled ? '请先完成饿了么Cookie、牵牛花Cookie和门店配置' : '';
+    }
+}
+
+// ==================== Cookies失效通知 ====================
+
+function handleCookiesInvalid(groupId, type) {
+    const group = groups.find(g => g.id === groupId);
+    if (!group) return;
+
+    const platformName = type === 'eleme' ? '饿了么' : '牵牛花';
+    
+    // 桌面通知
+    if (Notification.permission === 'granted') {
+        new Notification('Cookies已过期', {
+            body: `${group.name} 的${platformName}cookies已过期，请重新配置`
+        });
+    }
+    
+    // UI警告
+    alert(`⚠️ ${group.name} 的${platformName}cookies已过期，请重新配置`);
+    
+    // 重新加载组列表（显示错误状态）
+    loadGroups();
+}
+
+// ==================== 全局配置管理 ====================
+
+async function loadConfig() {
+    try {
+        const config = await ipcRequest('get-config');
+        globalConfig = config;
+        console.log('全局配置已加载:', globalConfig);
+    } catch (error) {
+        console.error('加载配置失败:', error);
+    }
+}
+
+/**
+ * 加载配置到表单
+ */
+async function loadConfigToForm() {
+    try {
+        const config = await ipcRequest('get-config');
+        globalConfig = config;
+        
+        // 填充表单
+        document.getElementById('incrementalInterval').value = config.incrementalInterval || 10;
+        document.getElementById('batchConcurrency').value = config.batchConcurrency || 3;
+        document.getElementById('debugMode').checked = config.debugMode || false;
+        document.getElementById('cookiesCheckInterval').value = config.cookiesCheckInterval || 24;
+        
+        console.log('配置已加载到表单:', config);
+    } catch (error) {
+        console.error('加载配置失败:', error);
+        alert('加载配置失败: ' + error.message);
+    }
+}
+
+/**
+ * 保存配置
+ */
+async function saveConfig() {
+    try {
+        const config = {
+            incrementalInterval: parseInt(document.getElementById('incrementalInterval').value) || 10,
+            batchConcurrency: parseInt(document.getElementById('batchConcurrency').value) || 3,
+            debugMode: document.getElementById('debugMode').checked,
+            cookiesCheckInterval: parseInt(document.getElementById('cookiesCheckInterval').value) || 24
+        };
+        
+        // 验证配置
+        if (config.incrementalInterval < 5 || config.incrementalInterval > 60) {
+            alert('增量同步间隔必须在5-60分钟之间');
+            return;
+        }
+        
+        if (config.batchConcurrency < 1 || config.batchConcurrency > 10) {
+            alert('批量同步并发数必须在1-10之间');
+            return;
+        }
+        
+        if (config.cookiesCheckInterval < 1 || config.cookiesCheckInterval > 168) {
+            alert('Cookies检测间隔必须在1-168小时之间');
+            return;
+        }
+        
+        const result = await ipcRequest('save-config', config);
+        
+        if (result.success) {
+            globalConfig = config;
+            alert('✅ 配置保存成功！');
+            console.log('配置已保存:', config);
+        } else {
+            alert('❌ 保存配置失败: ' + result.error);
+        }
+    } catch (error) {
+        console.error('保存配置失败:', error);
+        alert('❌ 保存配置失败: ' + error.message);
+    }
+}
+
+/**
+ * 恢复默认配置
+ */
+function resetConfig() {
+    if (confirm('确定要恢复默认配置吗？')) {
+        document.getElementById('incrementalInterval').value = 10;
+        document.getElementById('batchConcurrency').value = 3;
+        document.getElementById('debugMode').checked = false;
+        document.getElementById('cookiesCheckInterval').value = 24;
+        
+        console.log('配置已恢复为默认值');
+        alert('✅ 已恢复默认配置，请点击「保存配置」按钮保存');
+    }
+}
+
+// ==================== 暴露全局函数 ====================
+
+window.loadGroups = loadGroups;
+window.startIncrementalSync = startIncrementalSync;
+window.startFullSync = startFullSync;
+window.editGroup = editGroup;
+window.deleteGroup = deleteGroup;
+window.duplicateGroup = duplicateGroup;
+window.clearGroupLogs = clearGroupLogs;
+window.exportGroupLogs = exportGroupLogs;
+window.switchPage = switchPage;
+
+// 对话框函数
+window.openAddGroupDialog = openAddGroupDialog;
+window.closeAddGroupDialog = closeAddGroupDialog;
+window.confirmAddGroup = confirmAddGroup;
+window.openEditGroupDialog = openEditGroupDialog;
+window.closeEditGroupDialog = closeEditGroupDialog;
+window.confirmEditGroup = confirmEditGroup;
+window.openCookieDialog = openCookieDialog;
+window.closeCookieDialog = closeCookieDialog;
+window.confirmCookie = confirmCookie;
+window.selectQnhStore = selectQnhStore;
+window.refreshQnhStores = refreshQnhStores;
+
+// 全量同步对话框
+window.closeFullSyncDialog = closeFullSyncDialog;
+window.doFullSync = doFullSync;
+
+// 全局配置
+window.saveConfig = saveConfig;
+window.resetConfig = resetConfig;
