@@ -1,6 +1,6 @@
 {
   "name": "meituan-sync-tool",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "美团同步工具 - 饿了么到牵牛花库存同步",
   "main": "main.js",
   "scripts": {
@@ -36,6 +36,21 @@
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "美团同步工具",
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": ["zh_CN"],
+      "language": "2052",
+      "perMachine": false,
+      "runAfterFinish": true,
+      "warningsAsErrors": false,
+      "displayLanguageSelector": false
     },
     "mac": {
       "target": "dmg",

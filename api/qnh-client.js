@@ -9,6 +9,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const vm = require('vm');
 
 // 保存Node.js原生对象（mtgsig.js会删除/覆盖它们）
 const _Buffer = Buffer;
@@ -19,8 +20,7 @@ const _setInterval = setInterval;
 const _clearTimeout = clearTimeout;
 const _clearInterval = clearInterval;
 
-// 延迟加载mtgsig签名库：在签名前注入Cookie/Referrer再加载
-const MTGSIG_PATH = path.join(__dirname, '..', 'lib', 'mtgsig.js');
+// 不再直接 require mtgsig.js，以避免其污染全局；改为在 VM 沙箱中按实例隔离加载
 
 // 恢复Node.js原生对象与计时器，避免影响主进程事件循环
 globalThis.Buffer = _Buffer;
@@ -55,6 +55,37 @@ class QianniuhuaClient {
         // 缓存
         this._storesCache = null;
         this._productsCache = {};
+
+        // 为本实例创建独立的签名沙箱上下文
+        try {
+            const signerCodePath = path.join(__dirname, '../lib/mtgsig.js');
+            const signerCode = fs.readFileSync(signerCodePath, 'utf8');
+            // 为沙箱提供必要的内置对象与计时器
+            this._signerContext = vm.createContext({
+                console,
+                setTimeout,
+                setInterval,
+                clearTimeout,
+                clearInterval
+            });
+            // 注入 CommonJS 模块对象与 globalThis，供 mtgsig.js 使用
+            this._signerContext.globalThis = this._signerContext;
+            this._signerContext.module = { exports: {} };
+            this._signerContext.exports = this._signerContext.module.exports;
+            // 在加载前用本实例的 Cookie 覆盖源码中的硬编码 cookie，避免初始化阶段被缓存
+            const runtimeCookie = (this.rawCookies || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            const signerCodePatched = signerCode.replace(/cookie:\s*'[^']*'/, `cookie: '${runtimeCookie}'`);
+
+            // 运行签名库代码
+            vm.runInContext(signerCodePatched, this._signerContext, { filename: 'mtgsig.js' });
+            // 绑定 getSign 引用（优先取 module.exports.getSign）
+            this._getSign = (this._signerContext.module && this._signerContext.module.exports && this._signerContext.module.exports.getSign)
+                ? this._signerContext.module.exports.getSign
+                : this._signerContext.getSign;
+        } catch (e) {
+            console.error('[QNH] 初始化签名沙箱失败:', e);
+            this._signerContext = null;
+        }
     }
 
     /**
@@ -77,40 +108,32 @@ class QianniuhuaClient {
      * 生成mtgsig签名
      * 使用完整的mtgsig.js库（7900行，已破解算法）
      */
-    generateMtgsig(url, body, signOptions = {}) {
+    generateMtgsig(url, body) {
         const urlObj = new URL(url);
         
         try {
             // 提取原始URL（不含query参数）
             const oriUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
             
-            // 使用独立子进程生成签名，避免共享旧指纹，支持多组 Cookies 切换
+            // 调用完整签名库
+            // getSign(method, url, oriUrl, data)
             const method = 'POST';
             const dataStr = JSON.stringify(body);
-            const signerPath = path.join(__dirname, '..', 'lib', 'mtgsig_signer.js');
-            const payload = {
-                method,
-                url,
-                oriUrl,
-                data: dataStr,
-                cookie: this.getCookieString(),
-                referrerUrl: 'https://qnh.meituan.com/goods/edit',
-                traceId: (signOptions && signOptions.traceId) || '5678042275886624881',
-                contentType: 'application/json;charset=UTF-8'
-            };
 
-            const { spawnSync } = require('child_process');
-            const env = Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' });
-            const proc = spawnSync(process.execPath, [signerPath], {
-                input: JSON.stringify(payload),
-                encoding: 'utf8',
-                env
-            });
-            const out = (proc.stdout || '').trim();
-            if (!out) {
-                throw new Error('mtgsig生成失败');
+            if (!this._signerContext || typeof this._getSign !== 'function') {
+                throw new Error('签名环境未就绪');
             }
-            return out;
+
+            // 为本实例沙箱注入当前 Cookies（隔离且并发安全）
+            if (this._signerContext.document) {
+                this._signerContext.document.cookie = this.getCookieString();
+            } else {
+                // 若未定义 document，则创建最小对象
+                this._signerContext.document = { cookie: this.getCookieString() };
+            }
+
+            const mtgsig = this._getSign(method, url, oriUrl, dataStr);
+            return mtgsig;
         } catch (error) {
             console.error('[QNH] 生成签名失败:', error);
             console.error('  错误详情:', error.message);
@@ -143,21 +166,11 @@ class QianniuhuaClient {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
             'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
             'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"macOS"',
-            'X-Requested-With': 'XMLHttpRequest'
+            'sec-ch-ua-platform': '"macOS"'
         };
 
         if (mtgsig) {
             headers['mtgsig'] = mtgsig;
-        }
-
-        // 环境变量覆盖，便于与获取 cookies 的浏览器环境对齐
-        if (process && process.env) {
-            if (process.env.QNH_UA) headers['User-Agent'] = process.env.QNH_UA;
-            if (process.env.QNH_SEC_CH_UA) headers['sec-ch-ua'] = process.env.QNH_SEC_CH_UA;
-            if (process.env.QNH_SEC_CH_UA_PLATFORM) headers['sec-ch-ua-platform'] = process.env.QNH_SEC_CH_UA_PLATFORM;
-            if (process.env.QNH_REFERER_URL) headers['Referer'] = process.env.QNH_REFERER_URL;
-            if (process.env.QNH_TRACE_ID) headers['M-TRACEID'] = process.env.QNH_TRACE_ID;
         }
 
         return headers;
@@ -182,20 +195,13 @@ class QianniuhuaClient {
                 let mtgsig = null;
                 if (needSign && data && method === 'POST') {
                     // 使用完整URL生成签名
-                    mtgsig = this.generateMtgsig(url, data, {
-                        // 与 headers 的 Referer 对齐：按页面真实请求通常来自 /goods/edit
-                        referrerPath: '/goods/edit',
-                        referrerUrl: 'https://qnh.meituan.com/goods/edit',
-                        traceId: process.env.QNH_TRACE_ID || '5678042275886624881',
-                    });
+                    mtgsig = this.generateMtgsig(url, data);
                     console.log(`[QNH] 生成签名: ${mtgsig ? mtgsig.substring(0, 50) + '...' : 'null'}`);
                 }
 
                 const headers = this.getHeaders(mtgsig);
                 headers['Cookie'] = this.getCookieString();
                 headers['Host'] = urlObj.host;
-                // 与签名上下文对齐（服务端复算会校验）
-                headers['qnhReferrer'] = '/home.html';
 
                 let postData = '';
                 if (data && method === 'POST') {
@@ -225,7 +231,7 @@ class QianniuhuaClient {
                         body += chunk;
                     });
 
-                res.on('end', () => {
+                    res.on('end', () => {
                         try {
                             const result = JSON.parse(body);
                             
@@ -234,20 +240,27 @@ class QianniuhuaClient {
                                 console.log(`[QNH] 接口调用成功`);
                                 resolve(result);
                             } else {
-                                const errorMsg = result.msg || '未知错误';
-                                console.error(`[QNH] 接口返回错误: ${errorMsg}`);
-                                reject(new Error(`API错误: ${errorMsg}`));
+                                // 尝试从多个可能的字段中提取错误信息
+                                const errorMsg = result.msg || result.message || result.error || result.errMsg || result.errorMessage;
+                                
+                                // 如果仍然没有错误信息，打印完整响应以便调试
+                                if (!errorMsg) {
+                                    console.error(`[QNH] 接口返回错误，但未找到错误信息。完整响应:`, JSON.stringify(result, null, 2));
+                                    const errorDetail = `接口返回错误 (code: ${result.code})，但响应中未包含错误描述。请检查Cookie是否有效或联系技术支持`;
+                                    console.error(`[QNH] ${errorDetail}`);
+                                    reject(new Error(errorDetail));
+                                } else {
+                                    console.error(`[QNH] 接口返回错误 (code: ${result.code}): ${errorMsg}`);
+                                    // 如果有额外的data字段，也打印出来
+                                    if (result.data) {
+                                        console.error(`[QNH] 错误详情:`, JSON.stringify(result.data, null, 2));
+                                    }
+                                    reject(new Error(`牵牛花API错误 (code: ${result.code}): ${errorMsg}`));
+                                }
                             }
                         } catch (error) {
-                        // 打印调试信息：状态码、内容类型、重定向位置与部分body
-                        try {
-                            const ct = res.headers && res.headers['content-type'];
-                            const loc = res.headers && (res.headers['location'] || res.headers['Location']);
-                            const snippet = (body || '').slice(0, 400).replace(/\n/g, '\\n');
-                            console.error(`[QNH] 非JSON响应: status=${res.statusCode}, content-type=${ct || ''}, location=${loc || ''}`);
-                            console.error(`[QNH] 响应片段: ${snippet}`);
-                        } catch (e) {}
-                        console.error('[QNH] 解析响应失败:', error);
+                            console.error('[QNH] 解析响应失败:', error);
+                            console.error('[QNH] 原始响应内容:', body.substring(0, 500));
                             reject(new Error('解析响应失败: ' + error.message));
                         }
                     });
@@ -531,17 +544,27 @@ class QianniuhuaClient {
      * @param {number} maxRetries - 最大重试次数（默认3次）
      * @returns {Promise<string|null>} 导出文件路径，失败返回null
      */
-    async exportProducts(storeId, exportPath = null, maxRetries = 3, options = {}) {
+    async exportProducts(storeId, exportPath = null, maxRetries = 2, options = {}) {
         if (!exportPath) {
             exportPath = `data/qnh_products_store_${storeId}.xlsx`;
         }
 
         // 重试逻辑
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const logFn = (level, message) => {
+                try {
+                    if (options && typeof options.log === 'function') {
+                        options.log(level, message);
+                    }
+                } catch (_) {}
+            };
+
             console.log(`[QNH] 导出商品 - 第${attempt}次尝试（共${maxRetries}次）`);
+            logFn('info', `牵牛花导出：第${attempt}次尝试（共${maxRetries}次）`);
             
             if (options.shouldCancel && options.shouldCancel()) {
                 console.warn('[QNH] 导出任务被取消（开始前）');
+                logFn('warn', '牵牛花导出任务被取消（开始前）');
                 return null;
             }
 
@@ -550,22 +573,26 @@ class QianniuhuaClient {
             if (result) {
                 // 成功
                 console.log(`[QNH] 导出成功（第${attempt}次尝试）`);
+                logFn('info', `牵牛花导出成功（第${attempt}次尝试）`);
                 return result;
             }
             
             // 失败，判断是否继续重试
             if (attempt < maxRetries) {
                 console.warn(`[QNH] 导出失败，将重新尝试（${attempt}/${maxRetries}）`);
+                logFn('warn', `牵牛花导出失败，将重新尝试（${attempt}/${maxRetries}）`);
                 // 5秒等待期间响应取消
                 for (let t = 0; t < 50; t++) {
                     if (options.shouldCancel && options.shouldCancel()) {
                         console.warn('[QNH] 导出任务被取消（等待重试期间）');
+                        logFn('warn', '牵牛花导出任务被取消（等待重试期间）');
                         return null;
                     }
                     await this._sleep(100);
                 }
             } else {
                 console.error(`[QNH] 导出失败，已达最大重试次数（${maxRetries}次）`);
+                logFn('error', `牵牛花导出失败，已达最大重试次数（${maxRetries}次）`);
             }
         }
 
@@ -578,6 +605,13 @@ class QianniuhuaClient {
      */
     async _exportProductsOnce(storeId, exportPath, options = {}) {
         try {
+            const logFn = (level, message) => {
+                try {
+                    if (options && typeof options.log === 'function') {
+                        options.log(level, message);
+                    }
+                } catch (_) {}
+            };
             // 1. 创建导出任务
             const url = 'https://qnh.meituan.com/qnh-gw3/api/product/store/export';
             const params = new URLSearchParams({
@@ -593,7 +627,9 @@ class QianniuhuaClient {
             console.log(`[QNH] 创建导出任务: storeId=${storeId} (原始), ${storeIdNum} (转换后), 类型=${typeof storeIdNum}`);
             
             if (isNaN(storeIdNum)) {
-                throw new Error(`门店ID必须是数字，当前值: ${storeId} (类型: ${typeof storeId})。请检查数据库中qnh_store_id字段，应该保存门店ID(如"1163301")，而不是门店名称(如"铁骑送酒（大洋店）")`);
+                const errMsg = `门店ID必须是数字，当前值: ${storeId} (类型: ${typeof storeId})。请检查数据库中qnh_store_id字段，应该保存门店ID(如"1163301")，而不是门店名称(如"铁骑送酒（大洋店）")`;
+                logFn('error', errMsg);
+                throw new Error(errMsg);
             }
             
             const data = {
@@ -662,6 +698,7 @@ class QianniuhuaClient {
             }
 
             console.log(`[QNH] 任务ID: ${taskId}，开始轮询任务状态...`);
+            logFn('info', `牵牛花导出任务创建成功，任务ID: ${taskId}，开始轮询状态，(如果5分钟没有成功将触发超时处理机制）`);
 
             // 3. 轮询任务状态
             const pollInterval = 10; // 秒
@@ -673,6 +710,7 @@ class QianniuhuaClient {
                 for (let t = 0; t < pollInterval * 10; t++) {
                     if (options.shouldCancel && options.shouldCancel()) {
                         console.warn('[QNH] 导出任务被取消（轮询等待中）');
+                        logFn('warn', '牵牛花导出任务被取消（轮询等待中）');
                         return null;
                     }
                     await this._sleep(100);
@@ -682,6 +720,7 @@ class QianniuhuaClient {
                 // 查询任务状态
                 if (options.shouldCancel && options.shouldCancel()) {
                     console.warn('[QNH] 导出任务被取消（查询前）');
+                    logFn('warn', '牵牛花导出任务被取消（查询前）');
                     return null;
                 }
                 const taskStatus = await this._queryExportTaskStatus(taskId);
@@ -702,11 +741,13 @@ class QianniuhuaClient {
                         downloadUrl = handleResult.fileUrl;
                     } catch (e) {
                         console.error(`[QNH] 解析handleResult失败: ${handleResultStr}`);
+                        logFn('error', `牵牛花导出任务解析handleResult失败: ${handleResultStr}`);
                         return null;
                     }
 
                     if (!downloadUrl) {
                         console.error(`[QNH] 未获取到下载URL，handleResult: ${handleResultStr}`);
+                        logFn('error', `牵牛花导出任务未获取到下载URL，handleResult: ${handleResultStr}`);
                         return null;
                     }
 
@@ -716,10 +757,12 @@ class QianniuhuaClient {
                     // 4. 下载文件
                     if (options.shouldCancel && options.shouldCancel()) {
                         console.warn('[QNH] 导出任务被取消（下载前）');
+                        logFn('warn', '牵牛花导出任务被取消（下载前）');
                         return null;
                     }
                     await this._downloadExcel(downloadUrl, exportPath);
                     console.log(`[QNH] 文件下载成功: ${exportPath}`);
+                    logFn('info', `牵牛花导出Excel下载成功: ${exportPath}`);
 
                     return exportPath;
 
@@ -727,6 +770,7 @@ class QianniuhuaClient {
                     const errorMsg = taskStatus.handleResult || '未知错误';
                     console.error(`[QNH] 导出任务${status}: ${errorMsg}`);
                     console.error(`[QNH] 任务ID ${taskId} 失败，停止轮询`);
+                    logFn('error', `牵牛花导出任务${status}：${errorMsg}`);
                     return null; // 立即返回失败，不再继续轮询
                 }
 
@@ -734,10 +778,16 @@ class QianniuhuaClient {
             }
 
             console.error(`[QNH] 任务超时（${maxWaitTime}秒）`);
+            logFn('error', `牵牛花导出任务超时（${maxWaitTime}秒）`);
             return null;
 
         } catch (error) {
             console.error('[QNH] 导出商品失败:', error);
+            try {
+                if (options && typeof options.log === 'function') {
+                    options.log('error', `牵牛花导出商品失败：${error.message}`);
+                }
+            } catch (_) {}
             return null;
         }
     }

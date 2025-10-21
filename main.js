@@ -539,6 +539,12 @@ ipcMain.handle('save-config', async (event, config) => {
  * IPC通信处理器 - 工具方法
  */
 
+// 获取应用版本
+ipcMain.handle('get-app-version', () => {
+    const packageJson = require('./package.json');
+    return packageJson.version;
+});
+
 // 获取应用路径
 ipcMain.handle('get-app-path', () => {
     return app.getPath('userData');

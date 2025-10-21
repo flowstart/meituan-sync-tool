@@ -550,7 +550,7 @@ class SyncDatabase {
     }
 
     /**
-     * 获取组的操作日志
+     * 获取组的操作日志（仅失败记录）
      * @param {number} groupId - 组ID
      * @param {number} limit - 限制数量
      * @returns {Array<Object>} 日志列表
@@ -558,7 +558,7 @@ class SyncDatabase {
     getGroupLogs(groupId, limit = 100) {
         const stmt = this.db.prepare(`
             SELECT * FROM operation_log
-            WHERE group_id = ?
+            WHERE group_id = ? AND success = 0
             ORDER BY created_at DESC
             LIMIT ?
         `);
@@ -566,7 +566,7 @@ class SyncDatabase {
     }
 
     /**
-     * 获取最近的操作日志
+     * 获取最近的操作日志（仅失败记录）
      * @param {number} limit - 限制数量
      * @returns {Array<Object>} 日志列表
      */
@@ -575,6 +575,7 @@ class SyncDatabase {
             SELECT l.*, g.name as group_name
             FROM operation_log l
             LEFT JOIN sync_groups g ON l.group_id = g.id
+            WHERE l.success = 0
             ORDER BY l.created_at DESC
             LIMIT ?
         `);

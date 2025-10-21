@@ -231,6 +231,12 @@ class SyncManager extends EventEmitter {
                 try {
                     engine.cancel();
                     this._emitLog(groupId, 'warn', '收到终止任务指令，正在中止...');
+                    // 若存在定时任务，一并停止，避免下一轮自动触发
+                    if (this._scheduledTasks.has(groupId)) {
+                        this.stopScheduledSync(groupId);
+                        this._emitLog(groupId, 'info', '已同时停止该组的定时增量任务');
+                        return { success: true, action: 'cancel_running_and_stop_scheduled' };
+                    }
                     return { success: true, action: 'cancel_running' };
                 } catch (e) {
                     this._emitLog(groupId, 'error', `终止任务失败: ${e.message}`);
@@ -367,24 +373,30 @@ class SyncManager extends EventEmitter {
                     this._emitLog(groupId, 'info', '定时增量同步完成');
                 } else {
                     this._emitLog(groupId, 'error', `定时增量同步失败: ${result.error}`);
+                    // 若增量时间区间超阈值，则停止定时任务并提示用户应先做全量
+                    if (result.error === 'require_full_sync_due_to_time_range') {
+                        this._emitLog(groupId, 'warn', '由于增量区间超过3小时，已停止该组定时增量任务，请先进行一次全量同步任务');
+                        this.stopScheduledSync(groupId);
+                        return; // 直接结束本轮，不再记录下次时间
+                    }
                 }
             } catch (error) {
                 this._emitLog(groupId, 'error', `定时增量同步异常: ${error.message}`);
             } finally {
-                const next = new Date(Date.now() + intervalMs);
-                this._emitLog(groupId, 'info', `下次定时增量时间(北京时间): ${toBeijing(next)}`);
+                // 仅当定时任务仍然活跃时，才记录下次时间
+                if (this._scheduledTasks.has(groupId)) {
+                    const next = new Date(Date.now() + intervalMs);
+                    this._emitLog(groupId, 'info', `下次定时增量时间(北京时间): ${toBeijing(next)}`);
+                }
             }
         };
 
-        // 周期调度
+        // 周期调度：仅使用 setInterval，避免 setTimeout 与 setInterval 在首个间隔同时触发导致并发
         const timerId = setInterval(runOnce, intervalMs);
 
         if (runImmediately) {
-            // 立即先执行一轮
+            // 立即先执行一轮；后续由 setInterval 在 intervalMs 后再次触发
             runOnce();
-        } else {
-            // 首次延迟执行：在interval后执行第一次
-            setTimeout(runOnce, intervalMs);
         }
 
         this._scheduledTasks.set(groupId, {

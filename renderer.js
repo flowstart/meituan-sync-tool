@@ -22,7 +22,7 @@ let scheduledTasksActive = {};
 
 // ==================== 初始化 ====================
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     console.log('🚀 前端初始化...');
 
     // 初始化IPC监听
@@ -31,12 +31,46 @@ document.addEventListener('DOMContentLoaded', () => {
     // 初始化UI事件
     initUIEvents();
 
+    // 显示版本号
+    await updateVersionDisplay();
+
     // 加载全局配置
     loadConfig();
 
     // 加载同步组数据
     loadGroups();
 });
+
+// ==================== 版本显示 ====================
+
+let appVersion = '1.0.0'; // 默认版本
+
+async function updateVersionDisplay() {
+    try {
+        appVersion = await ipcRenderer.invoke('get-app-version');
+        updateStatusBar();
+        
+        // 在控制台显示欢迎信息
+        console.log('='.repeat(60));
+        console.log(`🚀 美团同步工具 V${appVersion}`);
+        console.log(`📦 Electron 应用 | Node.js ${process.versions.node}`);
+        console.log('='.repeat(60));
+    } catch (error) {
+        console.error('获取版本号失败:', error);
+    }
+}
+
+// 更新状态栏显示（可在任何地方调用）
+function updateStatusBar(customMessage = null) {
+    const statusBar = document.getElementById('statusBar');
+    if (statusBar) {
+        if (customMessage) {
+            statusBar.textContent = `🟢 V${appVersion} | ${customMessage}`;
+        } else {
+            statusBar.textContent = `🟢 V${appVersion} 系统运行正常`;
+        }
+    }
+}
 
 // ==================== IPC监听 ====================
 
@@ -496,19 +530,22 @@ async function doFullSync(groupId, startIncremental) {
         logs[groupId] = [];
         renderLogs();
 
-        await ipcRequest('sync-group', {
+        const fullResult = await ipcRequest('sync-group', {
             groupId,
             syncType: 'full'
         });
 
-        // 如果选择了自动开启增量，则启动定时任务
-        if (startIncremental) {
+        // 如果选择了自动开启增量，且全量成功，才启动定时任务
+        if (startIncremental && fullResult && fullResult.status === 'success') {
             await ipcRequest('start-scheduled-sync', {
                 groupId,
                 intervalMinutes: globalConfig.incrementalInterval,
                 runImmediately: false // 首次延迟执行：避免全量完成后立刻跑增量
             });
             console.log('定时增量同步已启动（首次延迟执行）');
+        } else if (startIncremental) {
+            console.warn('全量未成功（失败或被取消），不会启动定时增量任务');
+            alert('⚠️ 全量未成功，已取消“开启增量”的请求');
         }
         
         console.log('全量同步已启动');
@@ -652,6 +689,164 @@ function clearGroupLogs(groupId) {
 function exportGroupLogs(groupId) {
     alert(`导出组 ${groupId} 日志功能开发中...`);
     // TODO: 导出日志到文件
+}
+
+// ==================== 失败日志管理 ====================
+
+/**
+ * 打开失败日志对话框
+ */
+async function viewFailedLogs() {
+    const dialog = document.getElementById('failedLogsDialog');
+    
+    // 填充组筛选下拉框
+    const groupFilter = document.getElementById('failedLogsGroupFilter');
+    groupFilter.innerHTML = '<option value="">全部组</option>';
+    for (const group of groups) {
+        const option = document.createElement('option');
+        option.value = group.id;
+        option.textContent = group.name;
+        groupFilter.appendChild(option);
+    }
+    
+    dialog.showModal();
+    
+    // 加载日志
+    await refreshFailedLogs();
+}
+
+/**
+ * 关闭失败日志对话框
+ */
+function closeFailedLogsDialog() {
+    document.getElementById('failedLogsDialog').close();
+}
+
+/**
+ * 刷新失败日志
+ */
+async function refreshFailedLogs() {
+    const groupFilter = document.getElementById('failedLogsGroupFilter');
+    const limitFilter = document.getElementById('failedLogsLimitFilter');
+    const content = document.getElementById('failedLogsContent');
+    
+    const groupId = groupFilter.value ? parseInt(groupFilter.value) : null;
+    const limit = parseInt(limitFilter.value);
+    
+    try {
+        content.innerHTML = '<div style="text-align: center; color: #999;">加载中...</div>';
+        
+        const logs = await ipcRequest('get-operation-logs', { groupId, limit });
+        
+        if (!logs || logs.length === 0) {
+            content.innerHTML = '<div style="text-align: center; color: #999;">✅ 暂无失败记录</div>';
+            return;
+        }
+        
+        // 渲染失败日志表格
+        let html = `
+            <table style="width: 100%; border-collapse: collapse; background: white;">
+                <thead>
+                    <tr style="background: #f0f0f0; border-bottom: 2px solid #ddd;">
+                        <th style="padding: 10px; text-align: left;">时间</th>
+                        <th style="padding: 10px; text-align: left;">组名</th>
+                        <th style="padding: 10px; text-align: left;">类型</th>
+                        <th style="padding: 10px; text-align: left;">条形码</th>
+                        <th style="padding: 10px; text-align: center;">旧库存</th>
+                        <th style="padding: 10px; text-align: center;">新库存</th>
+                        <th style="padding: 10px; text-align: left;">错误信息</th>
+                    </tr>
+                </thead>
+                <tbody>
+        `;
+        
+        for (const log of logs) {
+            const time = new Date(log.created_at).toLocaleString('zh-CN', { 
+                timeZone: 'Asia/Shanghai',
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+            });
+            
+            const groupName = log.group_name || '未知';
+            const operationType = log.operation_type === 'full_sync' ? '全量同步' : '增量同步';
+            const oldStock = log.old_stock !== null ? log.old_stock : '-';
+            const newStock = log.new_stock !== null ? log.new_stock : '-';
+            const errorMsg = log.error_msg || '未知错误';
+            
+            html += `
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 8px; font-size: 12px;">${time}</td>
+                    <td style="padding: 8px;">${groupName}</td>
+                    <td style="padding: 8px;">${operationType}</td>
+                    <td style="padding: 8px; font-family: monospace;">${log.barcode || '-'}</td>
+                    <td style="padding: 8px; text-align: center;">${oldStock}</td>
+                    <td style="padding: 8px; text-align: center;">${newStock}</td>
+                    <td style="padding: 8px; font-size: 12px; color: #d32f2f;">${errorMsg}</td>
+                </tr>
+            `;
+        }
+        
+        html += '</tbody></table>';
+        content.innerHTML = html;
+        
+    } catch (error) {
+        console.error('加载失败日志失败:', error);
+        content.innerHTML = '<div style="text-align: center; color: #d32f2f;">❌ 加载失败: ' + error.message + '</div>';
+    }
+}
+
+/**
+ * 导出失败日志为 CSV
+ */
+async function exportFailedLogs() {
+    const groupFilter = document.getElementById('failedLogsGroupFilter');
+    const limitFilter = document.getElementById('failedLogsLimitFilter');
+    
+    const groupId = groupFilter.value ? parseInt(groupFilter.value) : null;
+    const limit = parseInt(limitFilter.value);
+    
+    try {
+        const logs = await ipcRequest('get-operation-logs', { groupId, limit });
+        
+        if (!logs || logs.length === 0) {
+            alert('没有可导出的失败日志');
+            return;
+        }
+        
+        // 生成 CSV 内容
+        let csv = '时间,组名,类型,条形码,旧库存,新库存,错误信息\n';
+        
+        for (const log of logs) {
+            const time = new Date(log.created_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+            const groupName = log.group_name || '未知';
+            const operationType = log.operation_type === 'full_sync' ? '全量同步' : '增量同步';
+            const barcode = log.barcode || '-';
+            const oldStock = log.old_stock !== null ? log.old_stock : '-';
+            const newStock = log.new_stock !== null ? log.new_stock : '-';
+            const errorMsg = (log.error_msg || '未知错误').replace(/"/g, '""'); // 转义引号
+            
+            csv += `"${time}","${groupName}","${operationType}","${barcode}","${oldStock}","${newStock}","${errorMsg}"\n`;
+        }
+        
+        // 创建下载
+        const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' }); // 添加 BOM 以支持 Excel
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `失败日志_${new Date().toISOString().slice(0, 10)}.csv`;
+        link.click();
+        URL.revokeObjectURL(url);
+        
+        alert('✅ 导出成功！');
+        
+    } catch (error) {
+        console.error('导出失败日志失败:', error);
+        alert('❌ 导出失败: ' + error.message);
+    }
 }
 
 // ==================== 整店校准 ====================
@@ -1278,11 +1473,15 @@ async function cancelSync(groupId) {
         const res = await ipcRequest('cancel-sync', { groupId });
         if (res && res.success) {
             // 若是停止定时任务，立即更新UI为待机但保留“定时开启”提示
-            if (res.action === 'stop_scheduled') {
+            if (res.action === 'stop_scheduled' || res.action === 'cancel_running_and_stop_scheduled') {
                 setGroupSyncState(groupId, false);
                 // 定时任务状态会通过 scheduled-task-changed 事件再次同步，这里快速反馈
                 updateScheduledTaskStatus(groupId, 'stop');
                 scheduledTasksActive[groupId] = false;
+                updateGroupButtonsEnabled(groupId);
+            } else if (res.action === 'cancel_running') {
+                // 仅取消当前任务，定时状态保持
+                setGroupSyncState(groupId, false);
                 updateGroupButtonsEnabled(groupId);
             }
         } else {
@@ -1484,3 +1683,9 @@ window.doFullSync = doFullSync;
 // 全局配置
 window.saveConfig = saveConfig;
 window.resetConfig = resetConfig;
+
+// 失败日志
+window.viewFailedLogs = viewFailedLogs;
+window.closeFailedLogsDialog = closeFailedLogsDialog;
+window.refreshFailedLogs = refreshFailedLogs;
+window.exportFailedLogs = exportFailedLogs;

@@ -271,17 +271,23 @@ class ElemeClient {
      * @param {number} pollInterval - 轮询间隔（秒）
      * @returns {Promise<Object|null>} 任务详情，如果超时返回null
      */
-    async getJobStatus(jobId, maxWait = 300, pollInterval = 5) {
+    async getJobStatus(jobId, maxWait = 300, pollInterval = 5, options = {}) {
         const startTime = Date.now();
         console.log(`[Eleme] 开始轮询任务状态，jobId: ${jobId}, 最长等待: ${maxWait}秒, 轮询间隔: ${pollInterval}秒`);
         
         let pollCount = 0;  // 轮询计数器
 
         while ((Date.now() - startTime) / 1000 < maxWait) {
+            if (options.shouldCancel && options.shouldCancel()) {
+                console.warn('[Eleme] 导出任务被取消（轮询前）');
+                try { if (typeof options.log === 'function') options.log('warn', '饿了么导出任务被取消（轮询前）'); } catch(_) {}
+                return null;
+            }
             const elapsed = Math.round((Date.now() - startTime) / 1000);
             try {
                 pollCount++;
                 console.log(`[Eleme] 第 ${pollCount} 次轮询 (已用时: ${elapsed}秒)...`);
+                try { if (typeof options.log === 'function') options.log('info', `饿了么导出轮询第${pollCount}次（已用时${elapsed}秒）`); } catch(_) {}
                 
                 const jobList = await this.getJobList();
 
@@ -298,10 +304,12 @@ class ElemeClient {
                         // 状态3表示成功
                         if (status === 3 && progress === 100) {
                             console.log(`[Eleme] ✅ 任务完成: ${job.downloadFileKey}`);
+                            try { if (typeof options.log === 'function') options.log('info', '饿了么导出任务完成'); } catch(_) {}
                             return job;
                         } else if (status < 0) {
                             // 失败状态
                             console.error(`[Eleme] ❌ 任务失败 (status=${status}): ${job.resultMsg || '未知错误'}`);
+                            try { if (typeof options.log === 'function') options.log('error', `饿了么导出任务失败 (status=${status}): ${job.resultMsg || '未知错误'}`); } catch(_) {}
                             return null;
                         }
 
@@ -327,12 +335,25 @@ class ElemeClient {
                 }
             }
 
-            // 等待后继续轮询
-            await this._sleep(pollInterval * 1000);
+            // 等待后继续轮询（细分为100ms片段以响应取消）
+            const waitMs = pollInterval * 1000;
+            const step = 100;
+            let waited = 0;
+            while (waited < waitMs) {
+                if (options.shouldCancel && options.shouldCancel()) {
+                    console.warn('[Eleme] 导出任务被取消（轮询等待中）');
+                    try { if (typeof options.log === 'function') options.log('warn', '饿了么导出任务被取消（轮询等待中）'); } catch(_) {}
+                    return null;
+                }
+                const remain = Math.min(step, waitMs - waited);
+                await this._sleep(remain);
+                waited += remain;
+            }
         }
 
         const totalTime = Math.round((Date.now() - startTime) / 1000);
         console.warn(`[Eleme] 任务超时（已等待${totalTime}秒，共轮询${pollCount}次），jobId: ${jobId}`);
+        try { if (typeof options.log === 'function') options.log('error', `饿了么导出任务超时（已等待${totalTime}秒，共轮询${pollCount}次）`); } catch(_) {}
         return null;
     }
 
@@ -359,9 +380,10 @@ class ElemeClient {
      * @param {string} savePath - 保存路径
      * @returns {Promise<boolean>} 是否成功
      */
-    async downloadFile(url, savePath) {
+    async downloadFile(url, savePath, options = {}) {
         return new Promise((resolve, reject) => {
             console.log(`[Eleme] 开始下载文件: ${savePath}`);
+            try { if (typeof options.log === 'function') options.log('info', `饿了么导出开始下载: ${savePath}`); } catch(_) {}
 
             // 确保目录存在
             const dir = path.dirname(savePath);
@@ -372,7 +394,7 @@ class ElemeClient {
             const urlObj = new URL(url);
             const protocol = urlObj.protocol === 'https:' ? https : http;
 
-            const options = {
+            const optionsReq = {
                 hostname: urlObj.hostname,
                 port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
                 path: urlObj.pathname + urlObj.search,
@@ -380,7 +402,13 @@ class ElemeClient {
                 timeout: 60000 // 60秒超时
             };
 
-            const req = protocol.request(options, (res) => {
+            if (options.shouldCancel && options.shouldCancel()) {
+                console.warn('[Eleme] 导出任务被取消（下载前）');
+                try { if (typeof options.log === 'function') options.log('warn', '饿了么导出任务被取消（下载前）'); } catch(_) {}
+                return reject(new Error('cancelled'));
+            }
+
+            const req = protocol.request(optionsReq, (res) => {
                 if (res.statusCode !== 200) {
                     reject(new Error(`下载失败，状态码: ${res.statusCode}`));
                     return;
@@ -393,6 +421,7 @@ class ElemeClient {
                 fileStream.on('finish', () => {
                     fileStream.close();
                     console.log(`[Eleme] 文件下载成功: ${savePath}`);
+                    try { if (typeof options.log === 'function') options.log('info', `饿了么导出下载成功: ${savePath}`); } catch(_) {}
                     resolve(true);
                 });
 
@@ -420,15 +449,21 @@ class ElemeClient {
      * @param {string} savePath - 保存路径
      * @returns {Promise<Object|null>} 任务信息，失败返回null
      */
-    async exportProducts(savePath) {
+    async exportProducts(savePath, options = {}) {
         try {
             // 1. 创建导出任务
             const jobId = await this.createExportJob();
 
             // 2. 等待任务完成
-            const job = await this.getJobStatus(jobId);
+            if (options.shouldCancel && options.shouldCancel()) {
+                console.warn('[Eleme] 导出任务被取消（创建任务后）');
+                try { if (typeof options.log === 'function') options.log('warn', '饿了么导出任务被取消（创建任务后）'); } catch(_) {}
+                return null;
+            }
+            const job = await this.getJobStatus(jobId, 300, 5, options);
             if (!job) {
                 console.error('[Eleme] 导出任务失败或超时');
+                try { if (typeof options.log === 'function') options.log('error', '饿了么导出任务失败或超时'); } catch(_) {}
                 return null;
             }
 
@@ -436,13 +471,20 @@ class ElemeClient {
             const downloadUrl = await this.getDownloadUrl(job.downloadFileKey);
 
             // 4. 下载文件
-            const success = await this.downloadFile(downloadUrl, savePath);
+            if (options.shouldCancel && options.shouldCancel()) {
+                console.warn('[Eleme] 导出任务被取消（下载前）');
+                try { if (typeof options.log === 'function') options.log('warn', '饿了么导出任务被取消（下载前）'); } catch(_) {}
+                return null;
+            }
+            const success = await this.downloadFile(downloadUrl, savePath, options);
             if (!success) {
                 console.error('[Eleme] 文件下载失败');
+                try { if (typeof options.log === 'function') options.log('error', '饿了么导出文件下载失败'); } catch(_) {}
                 return null;
             }
 
             console.log('[Eleme] 商品导出完成');
+            try { if (typeof options.log === 'function') options.log('info', '饿了么商品导出完成'); } catch(_) {}
             // 标准化返回（保留 gmtCreate 等服务端时间，便于作为基线）
             return {
                 jobId: job.jobId,
@@ -454,6 +496,7 @@ class ElemeClient {
 
         } catch (error) {
             console.error('[Eleme] 导出商品失败:', error);
+            try { if (typeof options.log === 'function') options.log('error', `饿了么导出商品失败：${error.message}`); } catch(_) {}
             return null;
         }
     }

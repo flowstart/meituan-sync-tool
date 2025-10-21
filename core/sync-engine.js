@@ -224,7 +224,10 @@ class SyncEngine {
             this._log('info', '步骤1: 从饿了么导出商品...');
             this._updateProgress(0, '导出饿了么商品...');
             const elemePath = path.join(exportDir, `group_${this.groupId}_eleme_${Date.now()}.xlsx`);
-            const elemeExportJob = await this.elemeClient.exportProducts(elemePath);
+            const elemeExportJob = await this.elemeClient.exportProducts(elemePath, {
+                shouldCancel: () => this._cancelRequested,
+                log: (level, message) => this._log(level, message)
+            });
             this._log('info', `饿了么商品导出完成: ${elemePath}`);
             this._updateProgress(20, '饿了么商品导出完成');
 
@@ -257,8 +260,9 @@ class SyncEngine {
             this._log('info', '步骤3: 从牵牛花导出商品...');
             this._updateProgress(20, '导出牵牛花商品...');
             const qnhPath = path.join(exportDir, `group_${this.groupId}_qnh_${Date.now()}.xlsx`);
-            const exportResult = await this.qnhClient.exportProducts(this.qnhStoreId, qnhPath, 3, {
-                shouldCancel: () => this._cancelRequested
+            const exportResult = await this.qnhClient.exportProducts(this.qnhStoreId, qnhPath, 2, {
+                shouldCancel: () => this._cancelRequested,
+                log: (level, message) => this._log(level, message)
             });
             
             let qnhProducts = [];
@@ -286,8 +290,8 @@ class SyncEngine {
                 }
                 this._log('info', `解析到 ${qnhProducts.length} 个牵牛花商品`);
             } else {
-                // 导出失败（3次重试后仍失败），使用分页接口作为回退方案
-                this._log('warn', '⚠️ 牵牛花导出失败（已重试3次），切换到分页接口获取商品');
+                // 导出失败（达到重试上限），使用分页接口作为回退方案
+                this._log('warn', '⚠️ 牵牛花导出失败（已达重试上限），切换到分页接口获取商品');
                 this._updateProgress(30, '导出失败，使用分页接口...');
                 
                 // 使用分页接口获取商品映射
@@ -408,20 +412,9 @@ class SyncEngine {
                     if (success) {
                         successCount += batch.length;
                         
-                        // 记录每个商品的操作日志
+                        // ✅ 优化：成功时不再记录操作日志，减少数据库写入
+                        // 仅保存商品映射
                         for (const item of batch) {
-                            this.db.addOperationLog(
-                                this.groupId,
-                                'full_sync',
-                                item.barcode,
-                                item.qnhStock,
-                                item.elemeStock,
-                                this.qnhStoreId,
-                                true,
-                                null
-                            );
-                            
-                            // 保存商品映射
                             this.db.saveProductMapping(
                                 this.groupId,
                                 item.barcode,
@@ -626,6 +619,19 @@ class SyncEngine {
 
             const endTime = Math.floor(Date.now() / 1000);
             const timeRangeMinutes = ((endTime - startTime) / 60).toFixed(1);
+
+            // 若时间区间超过3小时（180分钟），提示需要先做全量
+            if ((endTime - startTime) > 3 * 3600) {
+                const msg = '增量起始时间距离当前超过3小时，请先执行一次全量同步';
+                this._log('warn', msg);
+                this._updateProgress(-1, '需要先执行一次全量同步（区间>3小时）');
+                this.db.updateSyncHistory(syncId, {
+                    endTime: new Date(),
+                    status: 'failed',
+                    errorMsg: 'require_full_sync_due_to_time_range'
+                });
+                return { status: 'failed', error: 'require_full_sync_due_to_time_range' };
+            }
 
             // 日志：以秒级时间戳为主，同时展示标准北京时间
             this._log('info', `查询时间范围(时间戳秒): ${startTime} 到 ${endTime}`);
@@ -877,20 +883,9 @@ class SyncEngine {
                     if (success) {
                         successCount += batch.length;
                         
-                        // 记录每个商品的操作日志
+                        // ✅ 优化：成功时不再记录操作日志，减少数据库写入
+                        // 仅保存商品映射
                         for (const item of batch) {
-                            this.db.addOperationLog(
-                                this.groupId,
-                                'incremental_sync',
-                                item.barcode,
-                                null, // 增量同步不记录旧库存
-                                item.newQuantity,
-                                this.qnhStoreId,
-                                true,
-                                null
-                            );
-                            
-                            // 保存商品映射
                             this.db.saveProductMapping(
                                 this.groupId,
                                 item.barcode,
