@@ -19,8 +19,8 @@ const _setInterval = setInterval;
 const _clearTimeout = clearTimeout;
 const _clearInterval = clearInterval;
 
-// 导入完整的mtgsig签名库（其内部会伪造window并覆盖计时器）
-const mtgsigLib = require('../lib/mtgsig');
+// 延迟加载mtgsig签名库：在签名前注入Cookie/Referrer再加载
+const MTGSIG_PATH = path.join(__dirname, '..', 'lib', 'mtgsig.js');
 
 // 恢复Node.js原生对象与计时器，避免影响主进程事件循环
 globalThis.Buffer = _Buffer;
@@ -77,20 +77,40 @@ class QianniuhuaClient {
      * 生成mtgsig签名
      * 使用完整的mtgsig.js库（7900行，已破解算法）
      */
-    generateMtgsig(url, body) {
+    generateMtgsig(url, body, signOptions = {}) {
         const urlObj = new URL(url);
         
         try {
             // 提取原始URL（不含query参数）
             const oriUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}`;
             
-            // 调用完整签名库
-            // getSign(method, url, oriUrl, data)
+            // 使用独立子进程生成签名，避免共享旧指纹，支持多组 Cookies 切换
             const method = 'POST';
             const dataStr = JSON.stringify(body);
-            
-            const mtgsig = mtgsigLib.getSign(method, url, oriUrl, dataStr);
-            return mtgsig;
+            const signerPath = path.join(__dirname, '..', 'lib', 'mtgsig_signer.js');
+            const payload = {
+                method,
+                url,
+                oriUrl,
+                data: dataStr,
+                cookie: this.getCookieString(),
+                referrerUrl: 'https://qnh.meituan.com/goods/edit',
+                traceId: (signOptions && signOptions.traceId) || '5678042275886624881',
+                contentType: 'application/json;charset=UTF-8'
+            };
+
+            const { spawnSync } = require('child_process');
+            const env = Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' });
+            const proc = spawnSync(process.execPath, [signerPath], {
+                input: JSON.stringify(payload),
+                encoding: 'utf8',
+                env
+            });
+            const out = (proc.stdout || '').trim();
+            if (!out) {
+                throw new Error('mtgsig生成失败');
+            }
+            return out;
         } catch (error) {
             console.error('[QNH] 生成签名失败:', error);
             console.error('  错误详情:', error.message);
@@ -123,11 +143,21 @@ class QianniuhuaClient {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
             'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
             'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"macOS"'
+            'sec-ch-ua-platform': '"macOS"',
+            'X-Requested-With': 'XMLHttpRequest'
         };
 
         if (mtgsig) {
             headers['mtgsig'] = mtgsig;
+        }
+
+        // 环境变量覆盖，便于与获取 cookies 的浏览器环境对齐
+        if (process && process.env) {
+            if (process.env.QNH_UA) headers['User-Agent'] = process.env.QNH_UA;
+            if (process.env.QNH_SEC_CH_UA) headers['sec-ch-ua'] = process.env.QNH_SEC_CH_UA;
+            if (process.env.QNH_SEC_CH_UA_PLATFORM) headers['sec-ch-ua-platform'] = process.env.QNH_SEC_CH_UA_PLATFORM;
+            if (process.env.QNH_REFERER_URL) headers['Referer'] = process.env.QNH_REFERER_URL;
+            if (process.env.QNH_TRACE_ID) headers['M-TRACEID'] = process.env.QNH_TRACE_ID;
         }
 
         return headers;
@@ -152,13 +182,20 @@ class QianniuhuaClient {
                 let mtgsig = null;
                 if (needSign && data && method === 'POST') {
                     // 使用完整URL生成签名
-                    mtgsig = this.generateMtgsig(url, data);
+                    mtgsig = this.generateMtgsig(url, data, {
+                        // 与 headers 的 Referer 对齐：按页面真实请求通常来自 /goods/edit
+                        referrerPath: '/goods/edit',
+                        referrerUrl: 'https://qnh.meituan.com/goods/edit',
+                        traceId: process.env.QNH_TRACE_ID || '5678042275886624881',
+                    });
                     console.log(`[QNH] 生成签名: ${mtgsig ? mtgsig.substring(0, 50) + '...' : 'null'}`);
                 }
 
                 const headers = this.getHeaders(mtgsig);
                 headers['Cookie'] = this.getCookieString();
                 headers['Host'] = urlObj.host;
+                // 与签名上下文对齐（服务端复算会校验）
+                headers['qnhReferrer'] = '/home.html';
 
                 let postData = '';
                 if (data && method === 'POST') {
@@ -188,7 +225,7 @@ class QianniuhuaClient {
                         body += chunk;
                     });
 
-                    res.on('end', () => {
+                res.on('end', () => {
                         try {
                             const result = JSON.parse(body);
                             
@@ -202,7 +239,15 @@ class QianniuhuaClient {
                                 reject(new Error(`API错误: ${errorMsg}`));
                             }
                         } catch (error) {
-                            console.error('[QNH] 解析响应失败:', error);
+                        // 打印调试信息：状态码、内容类型、重定向位置与部分body
+                        try {
+                            const ct = res.headers && res.headers['content-type'];
+                            const loc = res.headers && (res.headers['location'] || res.headers['Location']);
+                            const snippet = (body || '').slice(0, 400).replace(/\n/g, '\\n');
+                            console.error(`[QNH] 非JSON响应: status=${res.statusCode}, content-type=${ct || ''}, location=${loc || ''}`);
+                            console.error(`[QNH] 响应片段: ${snippet}`);
+                        } catch (e) {}
+                        console.error('[QNH] 解析响应失败:', error);
                             reject(new Error('解析响应失败: ' + error.message));
                         }
                     });
