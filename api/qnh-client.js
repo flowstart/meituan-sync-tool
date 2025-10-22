@@ -332,20 +332,23 @@ class QianniuhuaClient {
             throw new Error('获取门店列表失败：数据格式错误');
         }
 
-        if (dataField.length > 0) {
-            if (typeof dataField[0] !== 'object') {
-                console.error(`[QNH] data[0]类型错误，期望object，实际: ${typeof dataField[0]}`);
-                throw new Error('获取门店列表失败：数据格式错误');
+        // 递归提取所有 itemType=3 的门店节点（兼容嵌套结构）
+        const extractStores = (node) => {
+            if (!node) return;
+            
+            // itemType=3 表示门店
+            if (node.itemType === 3 && node.itemCode && node.itemName) {
+                stores[node.itemCode] = node.itemName;
             }
+            
+            // 递归处理子节点
+            if (Array.isArray(node.children)) {
+                node.children.forEach(child => extractStores(child));
+            }
+        };
 
-            const children = dataField[0].children || [];
-            children.forEach(item => {
-                if (item && item.itemName && item.itemCode) {
-                    // Key是门店ID，Value是门店名称
-                    stores[item.itemCode] = item.itemName;
-                }
-            });
-        }
+        // 从根节点开始递归提取
+        dataField.forEach(rootNode => extractStores(rootNode));
 
         this._storesCache = stores;
         console.log(`[QNH] 获取到 ${Object.keys(stores).length} 个门店`);
@@ -1269,25 +1272,33 @@ class QianniuhuaClient {
 
             const result = await client._request('POST', fullUrl, data);
 
-            // 解析门店列表
+            // 解析门店列表（递归提取所有 itemType=3 的门店节点）
             const stores = {};
             const dataField = result.data;
 
-            if (Array.isArray(dataField) && dataField.length > 0) {
-                const children = dataField[0].children || [];
-                children.forEach(item => {
-                    if (item && item.itemName && item.itemCode) {
-                        // Key是门店ID，Value是门店名称
-                        stores[item.itemCode] = item.itemName;
+            if (Array.isArray(dataField)) {
+                const extractStores = (node) => {
+                    if (!node) return;
+                    
+                    // itemType=3 表示门店
+                    if (node.itemType === 3 && node.itemCode && node.itemName) {
+                        stores[node.itemCode] = node.itemName;
                     }
-                });
+                    
+                    // 递归处理子节点
+                    if (Array.isArray(node.children)) {
+                        node.children.forEach(child => extractStores(child));
+                    }
+                };
+                
+                dataField.forEach(rootNode => extractStores(rootNode));
             }
 
             if (Object.keys(stores).length > 0) {
                 return {
                     success: true,
                     stores: stores,
-                    storeList: Object.entries(stores).map(([name, id]) => ({
+                    storeList: Object.entries(stores).map(([id, name]) => ({
                         id: id,
                         name: name
                     }))
