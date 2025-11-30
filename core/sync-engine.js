@@ -4,7 +4,7 @@
  */
 
 const ElemeClient = require('../api/eleme-client');
-const QianniuhuaClient = require('../api/qnh-client');
+const createQnhClient = require('../api/qnh-client-factory');
 const ProductMatcher = require('./product-matcher');
 const { ElemeParser, QianniuhuaParser } = require('../utils/parsers');
 const path = require('path');
@@ -31,7 +31,7 @@ class SyncEngine {
 
         // 初始化API客户端
         this.elemeClient = new ElemeClient(elemeConfig);
-        this.qnhClient = new QianniuhuaClient(qnhConfig);
+        this.qnhClient = createQnhClient(null, qnhConfig);
         
         // 初始化匹配器
         this.matcher = new ProductMatcher();

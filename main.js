@@ -478,8 +478,8 @@ ipcMain.handle('validate-eleme-cookies', async (event, { groupId, cookies }) => 
 // 验证牵牛花cookies
 ipcMain.handle('validate-qnh-cookies', async (event, { groupId, cookies }) => {
     try {
-        const QnhClient = require('./api/qnh-client');
-        const client = new QnhClient({ cookies });
+        const createClient = require('./api/qnh-client-factory');
+        const client = createClient(null, { cookies });
         const stores = await client.getStores();
         
         // 更新数据库（注意：SQLite只接受数字，布尔值要转为0/1）
