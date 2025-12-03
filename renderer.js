@@ -216,6 +216,14 @@ function initUIEvents() {
 }
 
 function switchPage(pageName) {
+    // 切换页面前，关闭所有可能打开的对话框，避免焦点问题
+    document.querySelectorAll('dialog[open]').forEach(dialog => {
+        dialog.close();
+    });
+    
+    // 重置焦点到 body
+    document.body.focus();
+    
     // 切换标签页
     document.querySelectorAll('.tab').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.page === pageName);
@@ -2070,15 +2078,25 @@ async function openDualSyncConfigDialog(groupId = null) {
         document.getElementById('dualSyncBQnhStoreSelect').innerHTML = '<option value="">选择门店...</option>';
     }
     
+    // 修复焦点问题：先重置焦点状态，避免 confirm() 对话框导致的焦点残留
+    document.body.focus();
+    
     dialog.showModal();
     
-    // 修复焦点问题：延迟设置焦点到组名称输入框
-    setTimeout(() => {
-        const nameInput = document.getElementById('dualSyncGroupName');
-        if (nameInput) {
+    // 修复焦点问题：多次尝试设置焦点到组名称输入框
+    const nameInput = document.getElementById('dualSyncGroupName');
+    const setFocus = () => {
+        if (nameInput && document.activeElement !== nameInput) {
             nameInput.focus();
+            nameInput.select(); // 如果有内容则全选，方便修改
         }
-    }, 100);
+    };
+    
+    // 立即尝试一次
+    setFocus();
+    // 延迟再尝试，确保对话框完全渲染
+    setTimeout(setFocus, 50);
+    setTimeout(setFocus, 150);
 }
 
 // 更新双向同步侧边状态显示
