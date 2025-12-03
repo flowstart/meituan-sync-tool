@@ -12,6 +12,7 @@
         <div class="toolbar">
             <div class="tabs">
                 <div class="tab active" data-page="work">📊 工作状态</div>
+                <div class="tab" data-page="dual-sync">🔄 双向同步</div>
                 <!-- <div class="tab" data-page="calibration">⚙️ 整店校准</div> -->
                  <!-- 先临时隐藏掉整店校准的入口 -->
             </div>
@@ -63,6 +64,61 @@
             <!-- 底部状态栏 -->
             <div class="statusbar" id="statusBar">
                 🟢 系统运行正常
+            </div>
+        </div>
+
+        <!-- 双向同步页面 -->
+        <div id="page-dual-sync" class="page">
+            <div class="main-content">
+                <!-- 左侧：组配置 -->
+                <div class="left-panel">
+                    <div class="panel-header">
+                        <div class="panel-title">双向同步组</div>
+                        <button class="add-btn" id="addDualSyncGroupBtn">➕ 新增组</button>
+                    </div>
+
+                    <div class="groups-container" id="dualSyncGroupsContainer">
+                        <div class="loading-placeholder">
+                            <div>加载中...</div>
+                        </div>
+                    </div>
+
+                    <!-- 功能说明 -->
+                    <div class="dual-sync-info">
+                        <div class="info-title">💡 功能说明</div>
+                        <div class="info-content">
+                            <p>双向同步用于<b>A和B两个门店共享库存</b>的场景：</p>
+                            <ul>
+                                <li>A门店卖出商品 → 自动扣减B门店库存</li>
+                                <li>B门店卖出商品 → 自动扣减A门店库存</li>
+                            </ul>
+                            <p style="margin-top: 8px; color: #fa8c16;">⚠️ 首次使用请先执行全量同步</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 右侧：日志显示 -->
+                <div class="right-panel">
+                    <div class="panel-header">
+                        <div class="panel-title">实时日志</div>
+                        <div style="display: flex; gap: 8px;">
+                            <button class="action-btn" id="refreshDualSyncLogsBtn">🔄 刷新</button>
+                            <button class="action-btn" id="clearDualSyncLogsBtn">🗑️ 清空</button>
+                        </div>
+                    </div>
+
+                    <div class="logs-container" id="dualSyncLogsContainer">
+                        <div class="no-logs">
+                            <p>暂无日志</p>
+                            <p style="font-size: 12px; color: #8c8c8c;">选择组并开始同步后将显示实时日志</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 底部状态栏 -->
+            <div class="statusbar" id="dualSyncStatusBar">
+                💡 双向同步：实现A和B门店库存联动，任一方销售自动扣减另一方库存
             </div>
         </div>
 
@@ -239,6 +295,113 @@
         <div class="dialog-footer">
             <button class="btn btn-secondary" onclick="closeCookieDialog()">取消</button>
             <button class="btn btn-primary" onclick="confirmCookie()">保存并验证</button>
+        </div>
+    </dialog>
+
+    <!-- 双向同步组配置对话框 -->
+    <dialog id="dualSyncConfigDialog" class="dialog dialog-xlarge">
+        <div class="dialog-header">
+            <h3 id="dualSyncConfigTitle">🔄 配置双向同步组</h3>
+            <button class="dialog-close" onclick="closeDualSyncConfigDialog()">✕</button>
+        </div>
+        <div class="dialog-content">
+            <div class="dual-sync-config-form">
+                <!-- 组名称 -->
+                <div class="form-group">
+                    <label>组名称：</label>
+                    <input type="text" id="dualSyncGroupName" placeholder="例如：A-B门店联动">
+                </div>
+
+                <!-- 同步间隔 -->
+                <div class="form-group">
+                    <label>定时同步间隔（分钟）：</label>
+                    <input type="number" id="dualSyncInterval" min="5" max="60" value="10">
+                    <div class="form-hint">建议5-30分钟，根据销售频率调整</div>
+                </div>
+
+                <!-- A方配置 -->
+                <div class="config-side-card">
+                    <div class="side-card-header">
+                        <span class="side-label side-a">A方配置</span>
+                    </div>
+                    <div class="side-card-content">
+                        <!-- A饿了么 -->
+                        <div class="config-row">
+                            <span class="config-label">饿了么：</span>
+                            <span class="config-value" id="dualSyncAElemeStatus">未配置</span>
+                            <button class="btn btn-small" onclick="configureDualSyncCookie('a', 'eleme')">配置Cookie</button>
+                        </div>
+                        <!-- A牵牛花 -->
+                        <div class="config-row">
+                            <span class="config-label">牵牛花：</span>
+                            <span class="config-value" id="dualSyncAQnhStatus">未配置</span>
+                            <button class="btn btn-small" onclick="configureDualSyncCookie('a', 'qnh')">配置Cookie</button>
+                        </div>
+                        <!-- A牵牛花门店选择 -->
+                        <div class="config-row" id="dualSyncAQnhStoreRow" style="display: none;">
+                            <span class="config-label">门店：</span>
+                            <select id="dualSyncAQnhStoreSelect" onchange="selectDualSyncStore('a')">
+                                <option value="">选择门店...</option>
+                            </select>
+                            <button class="btn btn-small" onclick="refreshDualSyncQnhStores('a')" title="刷新门店列表">🔄</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- B方配置 -->
+                <div class="config-side-card">
+                    <div class="side-card-header">
+                        <span class="side-label side-b">B方配置</span>
+                    </div>
+                    <div class="side-card-content">
+                        <!-- B饿了么 -->
+                        <div class="config-row">
+                            <span class="config-label">饿了么：</span>
+                            <span class="config-value" id="dualSyncBElemeStatus">未配置</span>
+                            <button class="btn btn-small" onclick="configureDualSyncCookie('b', 'eleme')">配置Cookie</button>
+                        </div>
+                        <!-- B牵牛花 -->
+                        <div class="config-row">
+                            <span class="config-label">牵牛花：</span>
+                            <span class="config-value" id="dualSyncBQnhStatus">未配置</span>
+                            <button class="btn btn-small" onclick="configureDualSyncCookie('b', 'qnh')">配置Cookie</button>
+                        </div>
+                        <!-- B牵牛花门店选择 -->
+                        <div class="config-row" id="dualSyncBQnhStoreRow" style="display: none;">
+                            <span class="config-label">门店：</span>
+                            <select id="dualSyncBQnhStoreSelect" onchange="selectDualSyncStore('b')">
+                                <option value="">选择门店...</option>
+                            </select>
+                            <button class="btn btn-small" onclick="refreshDualSyncQnhStores('b')" title="刷新门店列表">🔄</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="dialog-footer">
+            <button class="btn btn-secondary" onclick="closeDualSyncConfigDialog()">取消</button>
+            <button class="btn btn-primary" onclick="saveDualSyncConfig()">保存配置</button>
+        </div>
+    </dialog>
+
+    <!-- 双向同步Cookie配置对话框 -->
+    <dialog id="dualSyncCookieDialog" class="dialog dialog-large">
+        <div class="dialog-header">
+            <h3 id="dualSyncCookieDialogTitle">🍪 配置Cookie</h3>
+            <button class="dialog-close" onclick="closeDualSyncCookieDialog()">✕</button>
+        </div>
+        <div class="dialog-content">
+            <div class="form-group">
+                <label id="dualSyncCookieDialogLabel">Cookie字符串：</label>
+                <textarea id="dualSyncCookieInput" rows="10" placeholder="粘贴完整的Cookie字符串..."></textarea>
+                <div class="form-hint">
+                    💡 提示：从浏览器开发者工具中复制完整的Cookie字符串
+                </div>
+            </div>
+        </div>
+        <div class="dialog-footer">
+            <button class="btn btn-secondary" onclick="closeDualSyncCookieDialog()">取消</button>
+            <button class="btn btn-primary" onclick="confirmDualSyncCookie()">保存并验证</button>
         </div>
     </dialog>
 

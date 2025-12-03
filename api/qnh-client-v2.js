@@ -105,6 +105,10 @@ class QianniuhuaClientV2 {
         return await this.products.getSkuIdsByBarcodes(storeId, barcodes);
     }
 
+    async getStockByBarcodes(storeId, barcodes) {
+        return await this.products.getStockByBarcodes(storeId, barcodes);
+    }
+
     async exportProducts(storeId, exportPath = null, maxRetries = 2, options = {}) {
         return await this.products.export(storeId, exportPath, maxRetries, options);
     }

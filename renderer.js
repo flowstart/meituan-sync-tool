@@ -197,6 +197,22 @@ function initUIEvents() {
     document.getElementById('cancelCalibrationBtn').addEventListener('click', () => {
         switchPage('work');
     });
+
+    // 双向同步相关按钮
+    const addDualSyncBtn = document.getElementById('addDualSyncGroupBtn');
+    if (addDualSyncBtn) {
+        addDualSyncBtn.addEventListener('click', () => openDualSyncConfigDialog());
+    }
+
+    const refreshDualSyncLogsBtn = document.getElementById('refreshDualSyncLogsBtn');
+    if (refreshDualSyncLogsBtn) {
+        refreshDualSyncLogsBtn.addEventListener('click', refreshDualSyncLogs);
+    }
+
+    const clearDualSyncLogsBtn = document.getElementById('clearDualSyncLogsBtn');
+    if (clearDualSyncLogsBtn) {
+        clearDualSyncLogsBtn.addEventListener('click', clearDualSyncLogs);
+    }
 }
 
 function switchPage(pageName) {
@@ -209,6 +225,11 @@ function switchPage(pageName) {
     document.querySelectorAll('.page').forEach(page => {
         page.classList.toggle('active', page.id === `page-${pageName}`);
     });
+
+    // 双向同步页面加载数据
+    if (pageName === 'dual-sync') {
+        loadDualSyncGroups();
+    }
 
     // 加载对应数据
     if (pageName === 'calibration') {
@@ -1689,3 +1710,787 @@ window.viewFailedLogs = viewFailedLogs;
 window.closeFailedLogsDialog = closeFailedLogsDialog;
 window.refreshFailedLogs = refreshFailedLogs;
 window.exportFailedLogs = exportFailedLogs;
+
+// ==================== 双向同步功能 ====================
+
+// 双向同步全局状态
+let dualSyncGroups = [];
+let dualSyncLogs = {}; // {groupId: [logs]}
+let currentDualSyncGroupId = null; // 当前选中/编辑的组ID
+let currentDualSyncCookieConfig = null; // 当前Cookie配置 {side: 'a'|'b', type: 'eleme'|'qnh'}
+let dualSyncRunningStates = {}; // 运行状态
+let dualSyncScheduledTasks = {}; // 定时任务状态
+let dualSyncQnhStores = { a: [], b: [] }; // 牵牛花门店列表缓存
+
+// 初始化双向同步IPC监听
+function initDualSyncIPCListeners() {
+    // 监听双向同步日志
+    ipcRenderer.on('dual-sync-log', (event, logEntry) => {
+        console.log('[双向同步日志]', logEntry);
+        addDualSyncLog(logEntry.groupId, logEntry.level, logEntry.message);
+    });
+
+    // 监听双向同步进度
+    ipcRenderer.on('dual-sync-progress', (event, { groupId, progress, message }) => {
+        if (!dualSyncRunningStates[groupId]) {
+            dualSyncRunningStates[groupId] = { syncing: true, type: 'incremental', progress: 0, message: '' };
+        }
+        dualSyncRunningStates[groupId].progress = progress;
+        dualSyncRunningStates[groupId].message = message;
+        updateDualSyncProgress(groupId, progress, message);
+    });
+
+    // 同步开始
+    ipcRenderer.on('dual-sync-started', (event, { groupId, type }) => {
+        setDualSyncGroupState(groupId, true, type);
+    });
+
+    // 同步完成
+    ipcRenderer.on('dual-sync-complete', (event, { groupId }) => {
+        setDualSyncGroupState(groupId, false);
+        loadDualSyncGroups(); // 刷新列表
+    });
+
+    // 定时任务状态变化
+    ipcRenderer.on('dual-sync-scheduled-changed', (event, { groupId, action }) => {
+        dualSyncScheduledTasks[groupId] = action === 'start';
+        renderDualSyncGroups();
+    });
+}
+
+// 初始化时调用
+initDualSyncIPCListeners();
+
+// 加载双向同步组
+async function loadDualSyncGroups() {
+    try {
+        dualSyncGroups = await ipcRenderer.invoke('dual-sync-get-groups');
+        
+        // 加载定时任务状态
+        const tasks = await ipcRenderer.invoke('dual-sync-get-scheduled-tasks');
+        dualSyncScheduledTasks = {};
+        for (const task of tasks) {
+            dualSyncScheduledTasks[task.groupId] = true;
+        }
+        
+        renderDualSyncGroups();
+    } catch (error) {
+        console.error('加载双向同步组失败:', error);
+    }
+}
+
+// 渲染双向同步组列表
+function renderDualSyncGroups() {
+    const container = document.getElementById('dualSyncGroupsContainer');
+    if (!container) return;
+
+    if (dualSyncGroups.length === 0) {
+        container.innerHTML = `
+            <div class="dual-sync-empty">
+                <div class="empty-icon">🔄</div>
+                <div class="empty-text">暂无双向同步组</div>
+                <button class="btn btn-primary" onclick="openDualSyncConfigDialog()">➕ 创建第一个组</button>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = dualSyncGroups.map(group => renderDualSyncGroupCard(group)).join('');
+}
+
+// 渲染单个双向同步组卡片
+function renderDualSyncGroupCard(group) {
+    const state = dualSyncRunningStates[group.id] || {};
+    const isRunning = state.syncing;
+    const isScheduled = dualSyncScheduledTasks[group.id];
+    
+    // 状态标签
+    let statusTag = '<span class="sync-status-tag idle">空闲</span>';
+    if (isRunning) {
+        statusTag = `<span class="sync-status-tag running">同步中${state.progress ? ` ${state.progress}%` : ''}</span>`;
+    } else if (isScheduled) {
+        statusTag = '<span class="sync-status-tag scheduled">定时运行中</span>';
+    }
+
+    // A方信息
+    const aElemeInfo = group.a_eleme_store_name || '未配置';
+    const aQnhInfo = group.a_qnh_store_name || '未配置';
+    
+    // B方信息
+    const bElemeInfo = group.b_eleme_store_name || '未配置';
+    const bQnhInfo = group.b_qnh_store_name || '未配置';
+
+    // 配置是否完整
+    const configComplete = group.a_eleme_cookies && group.a_qnh_store_id && 
+                           group.b_eleme_cookies && group.b_qnh_store_id;
+
+    // 上次同步信息
+    let lastSyncInfo = '';
+    if (group.last_full_sync_time) {
+        const time = new Date(group.last_full_sync_time).toLocaleString('zh-CN');
+        lastSyncInfo += `<span>全量: ${time}</span>`;
+    }
+    if (group.last_incr_sync_time) {
+        const time = new Date(group.last_incr_sync_time).toLocaleString('zh-CN');
+        const noChange = group.last_incr_sync_count === 0 ? '（无库存变化）' : '';
+        lastSyncInfo += `<span>增量: ${time}${noChange}</span>`;
+    }
+
+    return `
+        <div class="dual-sync-group-card ${currentDualSyncGroupId === group.id ? 'selected' : ''}" 
+             onclick="selectDualSyncGroup(${group.id})">
+            <div class="dual-sync-group-header">
+                <div class="dual-sync-group-name">${group.name}</div>
+                <div class="dual-sync-group-actions">
+                    ${statusTag}
+                    <button class="btn btn-small" onclick="event.stopPropagation(); openDualSyncConfigDialog(${group.id})" title="配置">⚙️</button>
+                    <button class="btn btn-small" onclick="event.stopPropagation(); duplicateDualSyncGroup(${group.id})" title="复制">📄</button>
+                    <button class="btn btn-small" onclick="event.stopPropagation(); deleteDualSyncGroup(${group.id})" title="删除">🗑️</button>
+                </div>
+            </div>
+            
+            <div class="dual-sync-group-status">
+                <div class="dual-sync-side">
+                    <div class="dual-sync-side-label side-a">🅰️ A方</div>
+                    <div class="dual-sync-side-info">
+                        <div>饿了么: <span class="store-name">${aElemeInfo}</span></div>
+                        <div>牵牛花: <span class="store-name">${aQnhInfo}</span></div>
+                    </div>
+                </div>
+                <div class="dual-sync-side">
+                    <div class="dual-sync-side-label side-b">🅱️ B方</div>
+                    <div class="dual-sync-side-info">
+                        <div>饿了么: <span class="store-name">${bElemeInfo}</span></div>
+                        <div>牵牛花: <span class="store-name">${bQnhInfo}</span></div>
+                    </div>
+                </div>
+            </div>
+            
+            ${lastSyncInfo ? `<div class="last-sync-info">${lastSyncInfo}</div>` : ''}
+            
+            ${isRunning ? `
+                <div class="sync-progress-bar">
+                    <div class="progress-inner" style="width: ${state.progress || 0}%"></div>
+                </div>
+            ` : ''}
+            
+            <div class="dual-sync-group-controls">
+                ${configComplete ? `
+                    ${isRunning ? `
+                        <button class="btn btn-danger" onclick="event.stopPropagation(); cancelDualSync(${group.id})">⏹️ 停止</button>
+                    ` : isScheduled ? `
+                        <button class="btn btn-danger-light" onclick="event.stopPropagation(); stopDualSyncScheduled(${group.id})">⏸️ 停止定时</button>
+                    ` : `
+                        <button class="btn btn-primary" onclick="event.stopPropagation(); startDualSyncFull(${group.id})">🔄 全量同步</button>
+                        <button class="btn btn-success" onclick="event.stopPropagation(); startDualSyncScheduled(${group.id}, ${group.sync_interval || 10})">▶️ 启动定时</button>
+                    `}
+                ` : `
+                    <button class="btn btn-warning" onclick="event.stopPropagation(); openDualSyncConfigDialog(${group.id})">⚠️ 完成配置</button>
+                `}
+            </div>
+        </div>
+    `;
+}
+
+// 选中双向同步组
+function selectDualSyncGroup(groupId) {
+    currentDualSyncGroupId = groupId;
+    renderDualSyncGroups();
+    loadDualSyncGroupLogs(groupId);
+}
+
+// 设置双向同步组运行状态
+function setDualSyncGroupState(groupId, syncing, type = null) {
+    if (syncing) {
+        dualSyncRunningStates[groupId] = { syncing: true, type: type, progress: 0, message: '' };
+    } else {
+        delete dualSyncRunningStates[groupId];
+    }
+    renderDualSyncGroups();
+}
+
+// 更新双向同步进度
+function updateDualSyncProgress(groupId, progress, message) {
+    renderDualSyncGroups();
+}
+
+// 添加双向同步日志
+function addDualSyncLog(groupId, level, message) {
+    if (!dualSyncLogs[groupId]) {
+        dualSyncLogs[groupId] = [];
+    }
+    
+    const timestamp = new Date().toLocaleTimeString('zh-CN');
+    dualSyncLogs[groupId].push({ timestamp, level, message });
+    
+    // 限制日志数量
+    if (dualSyncLogs[groupId].length > 200) {
+        dualSyncLogs[groupId].shift();
+    }
+    
+    // 如果是当前选中的组，更新日志显示
+    if (currentDualSyncGroupId === groupId) {
+        renderDualSyncLogs(groupId);
+    }
+}
+
+// 加载双向同步组日志
+async function loadDualSyncGroupLogs(groupId) {
+    try {
+        const logs = await ipcRenderer.invoke('dual-sync-get-logs', { groupId, limit: 100 });
+        dualSyncLogs[groupId] = logs.map(log => ({
+            timestamp: new Date(log.timestamp).toLocaleTimeString('zh-CN'),
+            level: log.level,
+            message: log.message
+        }));
+        renderDualSyncLogs(groupId);
+    } catch (error) {
+        console.error('加载双向同步日志失败:', error);
+    }
+}
+
+// 渲染双向同步日志
+function renderDualSyncLogs(groupId) {
+    const container = document.getElementById('dualSyncLogsContainer');
+    if (!container) return;
+
+    const logList = dualSyncLogs[groupId] || [];
+    const group = dualSyncGroups.find(g => g.id === groupId);
+    const groupName = group ? group.name : `组 ${groupId}`;
+    
+    // 使用和工作状态页面一样的 log-card 结构
+    const contentHtml = logList.length > 0
+        ? logList.map(log => {
+            // 检测 [!red] 标记，用红色显示
+            let message = log.message;
+            let messageStyle = '';
+            if (message.startsWith('[!red]')) {
+                message = message.replace('[!red]', '');
+                messageStyle = 'color: #e57373;';
+            }
+            return `
+                <div class="log-line">
+                    <span class="log-time">${log.timestamp}</span> |
+                    <span class="log-level-${log.level}">${log.level.toUpperCase()}</span> |
+                    <span style="${messageStyle}">${message}</span>
+                </div>
+            `;
+        }).join('')
+        : `<div class="log-line" style="color: #8c8c8c;">暂无日志，开始同步后将在此显示</div>`;
+
+    container.innerHTML = `
+        <div class="log-card">
+            <div class="log-header">
+                <div class="log-title">📋 ${groupName}</div>
+                <div class="log-actions">
+                    <button class="log-btn" onclick="clearDualSyncLogs()">清空</button>
+                </div>
+            </div>
+            <div class="log-content" id="dualSyncLogContent">
+                ${contentHtml}
+            </div>
+        </div>
+    `;
+
+    // 滚动到底部
+    const logContent = document.getElementById('dualSyncLogContent');
+    if (logContent) {
+        logContent.scrollTop = logContent.scrollHeight;
+    }
+}
+
+// 打开双向同步配置对话框
+async function openDualSyncConfigDialog(groupId = null) {
+    currentDualSyncGroupId = groupId;
+    
+    const dialog = document.getElementById('dualSyncConfigDialog');
+    const title = document.getElementById('dualSyncConfigTitle');
+    
+    if (groupId) {
+        title.textContent = '🔄 编辑双向同步组';
+        
+        // 加载组配置
+        const group = await ipcRenderer.invoke('dual-sync-get-group', groupId);
+        if (group) {
+            document.getElementById('dualSyncGroupName').value = group.name || '';
+            document.getElementById('dualSyncInterval').value = group.sync_interval || 10;
+            
+            // 更新A方状态显示
+            updateDualSyncSideStatus('a', 'eleme', group.a_eleme_store_name, group.a_eleme_cookies_valid);
+            updateDualSyncSideStatus('a', 'qnh', group.a_qnh_store_name, group.a_qnh_cookies_valid);
+            
+            // 更新B方状态显示
+            updateDualSyncSideStatus('b', 'eleme', group.b_eleme_store_name, group.b_eleme_cookies_valid);
+            updateDualSyncSideStatus('b', 'qnh', group.b_qnh_store_name, group.b_qnh_cookies_valid);
+            
+            // 如果A牵牛花已配置Cookie，显示门店选择（如果已有门店则显示）
+            if (group.a_qnh_cookies_valid || group.a_qnh_store_id) {
+                const aRow = document.getElementById('dualSyncAQnhStoreRow');
+                const aSelect = document.getElementById('dualSyncAQnhStoreSelect');
+                aRow.style.display = 'flex';
+                
+                // 如果有已选门店，先显示
+                if (group.a_qnh_store_id) {
+                    aSelect.innerHTML = `<option value="">选择门店...</option><option value="${group.a_qnh_store_id}" selected>${group.a_qnh_store_name || group.a_qnh_store_id}</option>`;
+                }
+            } else {
+                document.getElementById('dualSyncAQnhStoreRow').style.display = 'none';
+            }
+            
+            // 如果B牵牛花已配置Cookie，显示门店选择
+            if (group.b_qnh_cookies_valid || group.b_qnh_store_id) {
+                const bRow = document.getElementById('dualSyncBQnhStoreRow');
+                const bSelect = document.getElementById('dualSyncBQnhStoreSelect');
+                bRow.style.display = 'flex';
+                
+                if (group.b_qnh_store_id) {
+                    bSelect.innerHTML = `<option value="">选择门店...</option><option value="${group.b_qnh_store_id}" selected>${group.b_qnh_store_name || group.b_qnh_store_id}</option>`;
+                }
+            } else {
+                document.getElementById('dualSyncBQnhStoreRow').style.display = 'none';
+            }
+        }
+    } else {
+        title.textContent = '🔄 新增双向同步组';
+        document.getElementById('dualSyncGroupName').value = '';
+        document.getElementById('dualSyncInterval').value = 10;
+        
+        // 重置状态显示
+        updateDualSyncSideStatus('a', 'eleme', null, false);
+        updateDualSyncSideStatus('a', 'qnh', null, false);
+        updateDualSyncSideStatus('b', 'eleme', null, false);
+        updateDualSyncSideStatus('b', 'qnh', null, false);
+        
+        // 隐藏门店选择
+        document.getElementById('dualSyncAQnhStoreRow').style.display = 'none';
+        document.getElementById('dualSyncBQnhStoreRow').style.display = 'none';
+        
+        // 清空下拉框
+        document.getElementById('dualSyncAQnhStoreSelect').innerHTML = '<option value="">选择门店...</option>';
+        document.getElementById('dualSyncBQnhStoreSelect').innerHTML = '<option value="">选择门店...</option>';
+    }
+    
+    dialog.showModal();
+    
+    // 修复焦点问题：延迟设置焦点到组名称输入框
+    setTimeout(() => {
+        const nameInput = document.getElementById('dualSyncGroupName');
+        if (nameInput) {
+            nameInput.focus();
+        }
+    }, 100);
+}
+
+// 更新双向同步侧边状态显示
+function updateDualSyncSideStatus(side, type, storeName, isValid) {
+    const statusId = `dualSync${side.toUpperCase()}${type === 'eleme' ? 'Eleme' : 'Qnh'}Status`;
+    const statusEl = document.getElementById(statusId);
+    
+    if (statusEl) {
+        if (storeName) {
+            statusEl.textContent = storeName;
+            statusEl.className = 'config-value valid';
+        } else if (isValid) {
+            statusEl.textContent = type === 'qnh' ? '已验证，请选择门店' : '已验证';
+            statusEl.className = 'config-value valid';
+        } else {
+            statusEl.textContent = '未配置';
+            statusEl.className = 'config-value invalid';
+        }
+    }
+}
+
+// 关闭双向同步配置对话框
+function closeDualSyncConfigDialog() {
+    const dialog = document.getElementById('dualSyncConfigDialog');
+    dialog.close();
+}
+
+// 保存双向同步配置
+async function saveDualSyncConfig() {
+    const name = document.getElementById('dualSyncGroupName').value.trim();
+    const syncInterval = parseInt(document.getElementById('dualSyncInterval').value) || 10;
+    
+    if (!name) {
+        alert('请输入组名称');
+        return;
+    }
+    
+    try {
+        if (currentDualSyncGroupId) {
+            // 更新
+            await ipcRenderer.invoke('dual-sync-update-group', {
+                groupId: currentDualSyncGroupId,
+                updates: { name, sync_interval: syncInterval }
+            });
+        } else {
+            // 新增
+            const result = await ipcRenderer.invoke('dual-sync-add-group', {
+                name,
+                config: { sync_interval: syncInterval }
+            });
+            if (result.success) {
+                currentDualSyncGroupId = result.groupId;
+            } else {
+                throw new Error(result.error);
+            }
+        }
+        
+        closeDualSyncConfigDialog();
+        loadDualSyncGroups();
+    } catch (error) {
+        alert('保存失败: ' + error.message);
+    }
+}
+
+// 配置双向同步Cookie
+function configureDualSyncCookie(side, type) {
+    if (!currentDualSyncGroupId) {
+        // 先保存组
+        saveDualSyncConfigAndContinue(side, type);
+        return;
+    }
+    
+    currentDualSyncCookieConfig = { side, type };
+    
+    const dialog = document.getElementById('dualSyncCookieDialog');
+    const title = document.getElementById('dualSyncCookieDialogTitle');
+    const label = document.getElementById('dualSyncCookieDialogLabel');
+    
+    const sideLabel = side === 'a' ? 'A方' : 'B方';
+    const typeLabel = type === 'eleme' ? '饿了么' : '牵牛花';
+    
+    title.textContent = `🍪 配置${sideLabel}${typeLabel}Cookie`;
+    label.textContent = `${typeLabel}Cookie字符串：`;
+    document.getElementById('dualSyncCookieInput').value = '';
+    
+    dialog.showModal();
+}
+
+// 保存配置后继续配置Cookie
+async function saveDualSyncConfigAndContinue(side, type) {
+    const name = document.getElementById('dualSyncGroupName').value.trim();
+    const syncInterval = parseInt(document.getElementById('dualSyncInterval').value) || 10;
+    
+    if (!name) {
+        alert('请先输入组名称');
+        return;
+    }
+    
+    try {
+        const result = await ipcRenderer.invoke('dual-sync-add-group', {
+            name,
+            config: { sync_interval: syncInterval }
+        });
+        if (result.success) {
+            currentDualSyncGroupId = result.groupId;
+            configureDualSyncCookie(side, type);
+        } else {
+            throw new Error(result.error);
+        }
+    } catch (error) {
+        alert('保存失败: ' + error.message);
+    }
+}
+
+// 关闭双向同步Cookie对话框
+function closeDualSyncCookieDialog() {
+    const dialog = document.getElementById('dualSyncCookieDialog');
+    dialog.close();
+}
+
+// 确认双向同步Cookie
+async function confirmDualSyncCookie() {
+    const cookies = document.getElementById('dualSyncCookieInput').value.trim();
+    if (!cookies) {
+        alert('请输入Cookie');
+        return;
+    }
+    
+    const { side, type } = currentDualSyncCookieConfig;
+    const btn = document.querySelector('#dualSyncCookieDialog .btn-primary');
+    btn.disabled = true;
+    btn.textContent = '验证中...';
+    
+    try {
+        let result;
+        if (type === 'eleme') {
+            result = await ipcRenderer.invoke(`dual-sync-validate-${side}-eleme`, {
+                groupId: currentDualSyncGroupId,
+                cookies
+            });
+            
+            if (result.success) {
+                updateDualSyncSideStatus(side, 'eleme', result.storeName, true);
+                alert(`✅ ${side === 'a' ? 'A方' : 'B方'}饿了么验证成功\n门店: ${result.storeName}`);
+            }
+        } else {
+            result = await ipcRenderer.invoke(`dual-sync-validate-${side}-qnh`, {
+                groupId: currentDualSyncGroupId,
+                cookies
+            });
+            
+            if (result.success) {
+                dualSyncQnhStores[side] = result.stores;
+                updateDualSyncSideStatus(side, 'qnh', null, true);
+                
+                // 显示门店选择
+                const selectId = `dualSync${side.toUpperCase()}QnhStoreSelect`;
+                const rowId = `dualSync${side.toUpperCase()}QnhStoreRow`;
+                const select = document.getElementById(selectId);
+                const row = document.getElementById(rowId);
+                
+                select.innerHTML = '<option value="">选择门店...</option>' + 
+                    result.stores.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+                row.style.display = 'flex';
+                
+                alert(`✅ ${side === 'a' ? 'A方' : 'B方'}牵牛花验证成功\n请选择门店`);
+            }
+        }
+        
+        if (!result.success) {
+            alert('❌ 验证失败: ' + result.error);
+        } else {
+            closeDualSyncCookieDialog();
+        }
+    } catch (error) {
+        alert('验证失败: ' + error.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '保存并验证';
+    }
+}
+
+// 选择双向同步门店
+async function selectDualSyncStore(side) {
+    const selectId = `dualSync${side.toUpperCase()}QnhStoreSelect`;
+    const select = document.getElementById(selectId);
+    const storeId = select.value;
+    const storeName = select.options[select.selectedIndex].text;
+    
+    if (!storeId) return;
+    
+    try {
+        await ipcRenderer.invoke(`dual-sync-select-${side}-qnh-store`, {
+            groupId: currentDualSyncGroupId,
+            storeId,
+            storeName
+        });
+        
+        updateDualSyncSideStatus(side, 'qnh', storeName, true);
+    } catch (error) {
+        alert('选择门店失败: ' + error.message);
+    }
+}
+
+// 刷新双向同步牵牛花门店列表
+async function refreshDualSyncQnhStores(side) {
+    if (!currentDualSyncGroupId) {
+        alert('请先保存组配置');
+        return;
+    }
+    
+    // 获取当前组的Cookie
+    const group = await ipcRenderer.invoke('dual-sync-get-group', currentDualSyncGroupId);
+    const cookiesKey = `${side}_qnh_cookies`;
+    const cookies = group[cookiesKey];
+    
+    if (!cookies) {
+        alert('请先配置牵牛花Cookie');
+        return;
+    }
+    
+    try {
+        // 重新验证Cookie获取门店列表
+        const result = await ipcRenderer.invoke(`dual-sync-validate-${side}-qnh`, {
+            groupId: currentDualSyncGroupId,
+            cookies
+        });
+        
+        if (result.success) {
+            dualSyncQnhStores[side] = result.stores;
+            
+            // 更新下拉框
+            const selectId = `dualSync${side.toUpperCase()}QnhStoreSelect`;
+            const rowId = `dualSync${side.toUpperCase()}QnhStoreRow`;
+            const select = document.getElementById(selectId);
+            const row = document.getElementById(rowId);
+            
+            // 保留当前选中的门店
+            const currentStoreId = group[`${side}_qnh_store_id`];
+            
+            select.innerHTML = '<option value="">选择门店...</option>' + 
+                result.stores.map(s => `<option value="${s.id}" ${s.id === currentStoreId ? 'selected' : ''}>${s.name}</option>`).join('');
+            row.style.display = 'flex';
+            
+            alert(`✅ 刷新成功，获取到 ${result.stores.length} 个门店`);
+        } else {
+            alert('❌ 刷新失败: ' + result.error);
+        }
+    } catch (error) {
+        alert('刷新失败: ' + error.message);
+    }
+}
+
+// 删除双向同步组
+async function deleteDualSyncGroup(groupId) {
+    if (!confirm('确定要删除此双向同步组吗？')) return;
+    
+    try {
+        await ipcRenderer.invoke('dual-sync-delete-group', groupId);
+        loadDualSyncGroups();
+    } catch (error) {
+        alert('删除失败: ' + error.message);
+    }
+}
+
+// 复制双向同步组
+async function duplicateDualSyncGroup(groupId) {
+    try {
+        const group = dualSyncGroups.find(g => g.id === groupId);
+        if (!group) return;
+
+        // 生成新名称
+        let newName = `${group.name}（副本）`;
+        let suffix = 2;
+        while (dualSyncGroups.some(g => g.name === newName)) {
+            newName = `${group.name}（副本${suffix}）`;
+            suffix += 1;
+        }
+
+        const result = await ipcRenderer.invoke('dual-sync-duplicate-group', { groupId, newName });
+        if (result.success) {
+            await loadDualSyncGroups();
+            alert('✅ 已复制同步组');
+        } else {
+            alert('❌ 复制失败: ' + (result.error || '未知错误'));
+        }
+    } catch (error) {
+        alert('❌ 复制失败: ' + error.message);
+    }
+}
+
+// 启动双向全量同步
+async function startDualSyncFull(groupId) {
+    if (!confirm('全量同步会导出所有商品并更新两边的库存，可能需要5-15分钟，确定开始吗？')) return;
+    
+    // 自动选中该组，显示日志
+    selectDualSyncGroup(groupId);
+    
+    try {
+        setDualSyncGroupState(groupId, true, 'full');
+        addDualSyncLog(groupId, 'info', '开始全量同步...');
+        
+        const result = await ipcRenderer.invoke('dual-sync-full', { groupId });
+        
+        if (result.status === 'success') {
+            addDualSyncLog(groupId, 'info', `全量同步完成(A→B): 更新${result.updatesB}个商品`);
+        } else if (result.status === 'cancelled') {
+            addDualSyncLog(groupId, 'warn', '全量同步已取消');
+        } else {
+            addDualSyncLog(groupId, 'error', '全量同步失败: ' + result.error);
+        }
+    } catch (error) {
+        addDualSyncLog(groupId, 'error', '全量同步异常: ' + error.message);
+    } finally {
+        setDualSyncGroupState(groupId, false);
+        loadDualSyncGroups();
+    }
+}
+
+// 启动双向定时同步
+async function startDualSyncScheduled(groupId, intervalMinutes) {
+    // 自动选中该组，显示日志
+    selectDualSyncGroup(groupId);
+    
+    try {
+        await ipcRenderer.invoke('dual-sync-start-scheduled', {
+            groupId,
+            intervalMinutes,
+            runImmediately: true
+        });
+        
+        dualSyncScheduledTasks[groupId] = true;
+        renderDualSyncGroups();
+        addDualSyncLog(groupId, 'info', `定时同步已启动，间隔: ${intervalMinutes}分钟`);
+    } catch (error) {
+        alert('启动定时同步失败: ' + error.message);
+    }
+}
+
+// 停止双向定时同步
+async function stopDualSyncScheduled(groupId) {
+    if (!confirm('确定要停止定时同步吗？')) return;
+    
+    try {
+        await ipcRenderer.invoke('dual-sync-stop-scheduled', { groupId });
+        
+        dualSyncScheduledTasks[groupId] = false;
+        renderDualSyncGroups();
+        addDualSyncLog(groupId, 'info', '定时同步已停止');
+    } catch (error) {
+        alert('停止定时同步失败: ' + error.message);
+    }
+}
+
+// 取消双向同步
+async function cancelDualSync(groupId) {
+    try {
+        await ipcRenderer.invoke('dual-sync-cancel', { groupId });
+        addDualSyncLog(groupId, 'warn', '正在取消同步...');
+    } catch (error) {
+        alert('取消同步失败: ' + error.message);
+    }
+}
+
+// 刷新双向同步日志
+function refreshDualSyncLogs() {
+    if (currentDualSyncGroupId) {
+        loadDualSyncGroupLogs(currentDualSyncGroupId);
+    }
+}
+
+// 清空双向同步日志
+async function clearDualSyncLogs() {
+    if (currentDualSyncGroupId) {
+        try {
+            await ipcRenderer.invoke('dual-sync-clear-logs', { groupId: currentDualSyncGroupId });
+            dualSyncLogs[currentDualSyncGroupId] = [];
+            renderDualSyncLogs(currentDualSyncGroupId);
+        } catch (error) {
+            console.error('清空日志失败:', error);
+        }
+    }
+}
+
+// 页面切换时加载双向同步数据
+const originalSwitchPage = window.switchPage;
+window.switchPage = function(pageName) {
+    if (typeof originalSwitchPage === 'function') {
+        originalSwitchPage(pageName);
+    }
+    
+    if (pageName === 'dual-sync') {
+        loadDualSyncGroups();
+    }
+};
+
+// 暴露双向同步函数
+window.loadDualSyncGroups = loadDualSyncGroups;
+window.openDualSyncConfigDialog = openDualSyncConfigDialog;
+window.closeDualSyncConfigDialog = closeDualSyncConfigDialog;
+window.saveDualSyncConfig = saveDualSyncConfig;
+window.configureDualSyncCookie = configureDualSyncCookie;
+window.closeDualSyncCookieDialog = closeDualSyncCookieDialog;
+window.confirmDualSyncCookie = confirmDualSyncCookie;
+window.selectDualSyncStore = selectDualSyncStore;
+window.refreshDualSyncQnhStores = refreshDualSyncQnhStores;
+window.selectDualSyncGroup = selectDualSyncGroup;
+window.deleteDualSyncGroup = deleteDualSyncGroup;
+window.duplicateDualSyncGroup = duplicateDualSyncGroup;
+window.startDualSyncFull = startDualSyncFull;
+window.startDualSyncScheduled = startDualSyncScheduled;
+window.stopDualSyncScheduled = stopDualSyncScheduled;
+window.cancelDualSync = cancelDualSync;
+window.refreshDualSyncLogs = refreshDualSyncLogs;
+window.clearDualSyncLogs = clearDualSyncLogs;

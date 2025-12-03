@@ -8,10 +8,12 @@ const path = require('path');
 const logger = require('./utils/logger');
 const SyncDatabase = require('./database/database');
 const SyncManager = require('./core/sync-manager');
+const DualSyncManager = require('./core/dual-sync-manager');
 
 let mainWindow = null;
 let db = null;
 let syncManager = null;
+let dualSyncManager = null;
 
 /**
  * 创建主窗口
@@ -63,6 +65,10 @@ function initializeServices() {
         // 初始化同步管理器
         syncManager = new SyncManager(db);
         logger.info('同步管理器初始化完成');
+
+        // 初始化双向同步管理器
+        dualSyncManager = new DualSyncManager(db);
+        logger.info('双向同步管理器初始化完成');
 
         // 监听日志事件，转发到渲染进程
         syncManager.on('log', (logEntry) => {
@@ -123,6 +129,37 @@ function initializeServices() {
                 mainWindow.webContents.send('sync-complete', { groupId: data.groupId, result: data.result });
                 // 兼容已有监听
                 mainWindow.webContents.send('sync-finished', { groupId: data.groupId });
+            }
+        });
+
+        // 双向同步管理器事件监听
+        dualSyncManager.on('log', (logEntry) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('dual-sync-log', logEntry);
+            }
+        });
+
+        dualSyncManager.on('progress', (progressData) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('dual-sync-progress', progressData);
+            }
+        });
+
+        dualSyncManager.on('sync-started', (data) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('dual-sync-started', data);
+            }
+        });
+
+        dualSyncManager.on('sync-complete', (data) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('dual-sync-complete', data);
+            }
+        });
+
+        dualSyncManager.on('scheduled-task-changed', (data) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('dual-sync-scheduled-changed', data);
             }
         });
 
@@ -196,6 +233,12 @@ app.on('before-quit', () => {
     if (syncManager) {
         syncManager.close();
         logger.info('同步管理器已关闭');
+    }
+
+    // 停止双向同步管理器
+    if (dualSyncManager) {
+        dualSyncManager.close();
+        logger.info('双向同步管理器已关闭');
     }
     
     // 关闭数据库
@@ -560,6 +603,340 @@ ipcMain.handle('open-file', (event, filePath) => {
 ipcMain.on('log', (event, level, ...args) => {
     if (logger[level]) {
         logger[level](...args);
+    }
+});
+
+/**
+ * IPC通信处理器 - 双向同步组管理
+ */
+
+// 获取所有双向同步组
+ipcMain.handle('dual-sync-get-groups', async (event, enabledOnly = false) => {
+    try {
+        return db.getAllDualSyncGroups(enabledOnly);
+    } catch (error) {
+        logger.error('获取双向同步组列表失败:', error);
+        throw error;
+    }
+});
+
+// 获取指定双向同步组
+ipcMain.handle('dual-sync-get-group', async (event, groupId) => {
+    try {
+        return db.getDualSyncGroup(groupId);
+    } catch (error) {
+        logger.error(`获取双向同步组失败 (${groupId}):`, error);
+        throw error;
+    }
+});
+
+// 添加双向同步组
+ipcMain.handle('dual-sync-add-group', async (event, { name, config }) => {
+    try {
+        const groupId = db.addDualSyncGroup(name, config || {});
+        logger.info(`双向同步组添加成功: ${name} (ID: ${groupId})`);
+        return { success: true, groupId };
+    } catch (error) {
+        logger.error('添加双向同步组失败:', error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 更新双向同步组
+ipcMain.handle('dual-sync-update-group', async (event, { groupId, updates }) => {
+    try {
+        db.updateDualSyncGroup(groupId, updates);
+        // 刷新引擎配置
+        dualSyncManager.refreshEngine(groupId);
+        logger.info(`双向同步组更新成功: ${groupId}`);
+        return { success: true };
+    } catch (error) {
+        logger.error(`更新双向同步组失败 (${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 删除双向同步组
+ipcMain.handle('dual-sync-delete-group', async (event, groupId) => {
+    try {
+        // 先停止定时任务
+        dualSyncManager.stopScheduledSync(groupId);
+        db.deleteDualSyncGroup(groupId);
+        logger.info(`双向同步组删除成功: ${groupId}`);
+        return { success: true };
+    } catch (error) {
+        logger.error(`删除双向同步组失败 (${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 复制双向同步组
+ipcMain.handle('dual-sync-duplicate-group', async (event, { groupId, newName }) => {
+    try {
+        const newGroupId = db.duplicateDualSyncGroup(groupId, newName);
+        logger.info(`双向同步组复制成功: ${groupId} -> ${newGroupId}`);
+        return { success: true, groupId: newGroupId };
+    } catch (error) {
+        logger.error(`复制双向同步组失败 (${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+/**
+ * IPC通信处理器 - 双向同步操作
+ */
+
+// 执行全量同步
+ipcMain.handle('dual-sync-full', async (event, { groupId, options = {} }) => {
+    try {
+        logger.info(`开始双向全量同步: 组${groupId}`);
+        // 确保传入用户数据目录下的 data 子目录，避免打包后路径问题
+        const exportDir = path.join(app.getPath('userData'), 'data');
+        const result = await dualSyncManager.fullSync(groupId, { ...options, exportDir });
+        logger.info(`双向全量同步完成: 组${groupId}, 结果: ${result.status}`);
+        return result;
+    } catch (error) {
+        logger.error(`双向全量同步失败 (组${groupId}):`, error);
+        return { status: 'failed', error: error.message };
+    }
+});
+
+// 执行增量同步
+ipcMain.handle('dual-sync-incremental', async (event, { groupId }) => {
+    try {
+        logger.info(`开始双向增量同步: 组${groupId}`);
+        const result = await dualSyncManager.incrementalSync(groupId);
+        logger.info(`双向增量同步完成: 组${groupId}, 结果: ${result.status}`);
+        return result;
+    } catch (error) {
+        logger.error(`双向增量同步失败 (组${groupId}):`, error);
+        return { status: 'failed', error: error.message };
+    }
+});
+
+// 取消同步
+ipcMain.handle('dual-sync-cancel', async (event, { groupId }) => {
+    try {
+        const result = dualSyncManager.cancel(groupId);
+        return result;
+    } catch (error) {
+        logger.error(`取消双向同步失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+/**
+ * IPC通信处理器 - 双向同步定时任务
+ */
+
+// 启动定时任务
+ipcMain.handle('dual-sync-start-scheduled', (event, { groupId, intervalMinutes = 10, runImmediately = true }) => {
+    try {
+        dualSyncManager.startScheduledSync(groupId, intervalMinutes, { runImmediately });
+        logger.info(`双向同步定时任务启动: 组${groupId}, 间隔${intervalMinutes}分钟`);
+        return { success: true };
+    } catch (error) {
+        logger.error(`启动双向同步定时任务失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 停止定时任务
+ipcMain.handle('dual-sync-stop-scheduled', (event, { groupId }) => {
+    try {
+        dualSyncManager.stopScheduledSync(groupId);
+        logger.info(`双向同步定时任务停止: 组${groupId}`);
+        return { success: true };
+    } catch (error) {
+        logger.error(`停止双向同步定时任务失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 获取定时任务状态
+ipcMain.handle('dual-sync-get-scheduled-tasks', (event, groupId = null) => {
+    try {
+        return dualSyncManager.getScheduledTasks(groupId);
+    } catch (error) {
+        logger.error('获取双向同步定时任务失败:', error);
+        throw error;
+    }
+});
+
+/**
+ * IPC通信处理器 - 双向同步日志
+ */
+
+// 获取组日志
+ipcMain.handle('dual-sync-get-logs', (event, { groupId, limit = 100 }) => {
+    try {
+        return dualSyncManager.getGroupLogs(groupId, limit);
+    } catch (error) {
+        logger.error(`获取双向同步日志失败 (组${groupId}):`, error);
+        return [];
+    }
+});
+
+// 清空组日志
+ipcMain.handle('dual-sync-clear-logs', (event, { groupId }) => {
+    try {
+        dualSyncManager.clearGroupLogs(groupId);
+        return { success: true };
+    } catch (error) {
+        logger.error(`清空双向同步日志失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 获取同步历史
+ipcMain.handle('dual-sync-get-history', async (event, { groupId, limit = 50 }) => {
+    try {
+        return db.getDualSyncGroupHistory(groupId, limit);
+    } catch (error) {
+        logger.error('获取双向同步历史失败:', error);
+        throw error;
+    }
+});
+
+/**
+ * IPC通信处理器 - 双向同步Cookie验证
+ */
+
+// 验证A饿了么cookies
+ipcMain.handle('dual-sync-validate-a-eleme', async (event, { groupId, cookies }) => {
+    try {
+        const ElemeClient = require('./api/eleme-client');
+        const result = await ElemeClient.getShopInfoFromCookies(cookies);
+        
+        if (result.success) {
+            db.updateDualSyncGroup(groupId, {
+                a_eleme_cookies: cookies,
+                a_eleme_seller_id: result.seller_id,
+                a_eleme_store_id: result.store_id,
+                a_eleme_store_name: result.store_name,
+                a_eleme_cookies_valid: 1
+            });
+            dualSyncManager.refreshEngine(groupId);
+            
+            logger.info(`A饿了么cookies验证成功: 组${groupId}, 门店: ${result.store_name}`);
+            return { success: true, storeName: result.store_name };
+        } else {
+            return { success: false, error: result.error };
+        }
+    } catch (error) {
+        logger.error(`验证A饿了么cookies失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 验证B饿了么cookies
+ipcMain.handle('dual-sync-validate-b-eleme', async (event, { groupId, cookies }) => {
+    try {
+        const ElemeClient = require('./api/eleme-client');
+        const result = await ElemeClient.getShopInfoFromCookies(cookies);
+        
+        if (result.success) {
+            db.updateDualSyncGroup(groupId, {
+                b_eleme_cookies: cookies,
+                b_eleme_seller_id: result.seller_id,
+                b_eleme_store_id: result.store_id,
+                b_eleme_store_name: result.store_name,
+                b_eleme_cookies_valid: 1
+            });
+            dualSyncManager.refreshEngine(groupId);
+            
+            logger.info(`B饿了么cookies验证成功: 组${groupId}, 门店: ${result.store_name}`);
+            return { success: true, storeName: result.store_name };
+        } else {
+            return { success: false, error: result.error };
+        }
+    } catch (error) {
+        logger.error(`验证B饿了么cookies失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 验证A牵牛花cookies
+ipcMain.handle('dual-sync-validate-a-qnh', async (event, { groupId, cookies }) => {
+    try {
+        const createClient = require('./api/qnh-client-factory');
+        const client = createClient(null, { cookies });
+        const stores = await client.getStores();
+        
+        db.updateDualSyncGroup(groupId, {
+            a_qnh_cookies: cookies,
+            a_qnh_cookies_valid: 1
+        });
+        dualSyncManager.refreshEngine(groupId);
+        
+        logger.info(`A牵牛花cookies验证成功: 组${groupId}, 获取到${Object.keys(stores).length}个门店`);
+        
+        return {
+            success: true,
+            stores: Object.entries(stores).map(([id, name]) => ({ id, name }))
+        };
+    } catch (error) {
+        logger.error(`验证A牵牛花cookies失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 验证B牵牛花cookies
+ipcMain.handle('dual-sync-validate-b-qnh', async (event, { groupId, cookies }) => {
+    try {
+        const createClient = require('./api/qnh-client-factory');
+        const client = createClient(null, { cookies });
+        const stores = await client.getStores();
+        
+        db.updateDualSyncGroup(groupId, {
+            b_qnh_cookies: cookies,
+            b_qnh_cookies_valid: 1
+        });
+        dualSyncManager.refreshEngine(groupId);
+        
+        logger.info(`B牵牛花cookies验证成功: 组${groupId}, 获取到${Object.keys(stores).length}个门店`);
+        
+        return {
+            success: true,
+            stores: Object.entries(stores).map(([id, name]) => ({ id, name }))
+        };
+    } catch (error) {
+        logger.error(`验证B牵牛花cookies失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 选择A牵牛花门店
+ipcMain.handle('dual-sync-select-a-qnh-store', async (event, { groupId, storeId, storeName }) => {
+    try {
+        db.updateDualSyncGroup(groupId, {
+            a_qnh_store_id: storeId,
+            a_qnh_store_name: storeName
+        });
+        dualSyncManager.refreshEngine(groupId);
+        
+        logger.info(`A牵牛花门店选择成功: 组${groupId}, 门店: ${storeName}`);
+        return { success: true };
+    } catch (error) {
+        logger.error(`选择A牵牛花门店失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 选择B牵牛花门店
+ipcMain.handle('dual-sync-select-b-qnh-store', async (event, { groupId, storeId, storeName }) => {
+    try {
+        db.updateDualSyncGroup(groupId, {
+            b_qnh_store_id: storeId,
+            b_qnh_store_name: storeName
+        });
+        dualSyncManager.refreshEngine(groupId);
+        
+        logger.info(`B牵牛花门店选择成功: 组${groupId}, 门店: ${storeName}`);
+        return { success: true };
+    } catch (error) {
+        logger.error(`选择B牵牛花门店失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
     }
 });
 

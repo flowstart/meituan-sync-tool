@@ -119,7 +119,86 @@ class SyncDatabase {
             )
         `);
 
-        // 6. 数据库迁移：添加缺失的列（向后兼容）
+        // 6. 双向同步组配置表
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                -- A侧饿了么配置
+                a_eleme_cookies TEXT,
+                a_eleme_seller_id TEXT,
+                a_eleme_store_id TEXT,
+                a_eleme_store_name TEXT,
+                a_eleme_cookies_valid INTEGER DEFAULT 0,
+                -- A侧牵牛花配置
+                a_qnh_cookies TEXT,
+                a_qnh_store_id TEXT,
+                a_qnh_store_name TEXT,
+                a_qnh_cookies_valid INTEGER DEFAULT 0,
+                -- B侧饿了么配置
+                b_eleme_cookies TEXT,
+                b_eleme_seller_id TEXT,
+                b_eleme_store_id TEXT,
+                b_eleme_store_name TEXT,
+                b_eleme_cookies_valid INTEGER DEFAULT 0,
+                -- B侧牵牛花配置
+                b_qnh_cookies TEXT,
+                b_qnh_store_id TEXT,
+                b_qnh_store_name TEXT,
+                b_qnh_cookies_valid INTEGER DEFAULT 0,
+                -- 同步配置
+                sync_interval INTEGER DEFAULT 10,
+                enabled INTEGER DEFAULT 1,
+                -- 同步状态
+                last_full_sync_time TEXT,
+                last_full_sync_count INTEGER,
+                last_incr_sync_time TEXT,
+                last_incr_sync_count INTEGER,
+                last_a_query_time TEXT,
+                last_b_query_time TEXT,
+                -- 时间戳
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        `);
+
+        // 7. 双向同步历史表
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sync_type TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                status TEXT NOT NULL,
+                a_changes INTEGER DEFAULT 0,
+                b_changes INTEGER DEFAULT 0,
+                total_items INTEGER DEFAULT 0,
+                success_items INTEGER DEFAULT 0,
+                failed_items INTEGER DEFAULT 0,
+                error_msg TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
+        // 8. 双向同步库存快照表（用于记录同步后的库存值）
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_stock_snapshot (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                barcode TEXT NOT NULL,
+                product_name TEXT,
+                last_known_stock INTEGER,
+                last_sync_time TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(group_id, barcode),
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
+        // 9. 数据库迁移：添加缺失的列（向后兼容）
         this._migrateDatabase();
 
         // 创建索引
@@ -130,6 +209,10 @@ class SyncDatabase {
             CREATE INDEX IF NOT EXISTS idx_product_mapping_barcode ON product_mapping(eleme_barcode);
             CREATE INDEX IF NOT EXISTS idx_operation_log_group ON operation_log(group_id);
             CREATE INDEX IF NOT EXISTS idx_operation_log_time ON operation_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_history_group ON dual_sync_history(group_id);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_history_time ON dual_sync_history(start_time);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_stock_group ON dual_sync_stock_snapshot(group_id);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_stock_barcode ON dual_sync_stock_snapshot(barcode);
         `);
     }
 
@@ -685,6 +768,367 @@ class SyncDatabase {
     close() {
         this.db.close();
         console.log('[Database] 数据库连接已关闭');
+    }
+
+    // ==================== 双向同步组管理 ====================
+
+    /**
+     * 添加双向同步组
+     * @param {string} name - 组名称
+     * @param {Object} config - 配置对象
+     * @returns {number} 组ID
+     */
+    addDualSyncGroup(name, config = {}) {
+        const now = new Date().toISOString();
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_groups (
+                name,
+                a_eleme_cookies, a_eleme_seller_id, a_eleme_store_id, a_eleme_store_name,
+                a_qnh_cookies, a_qnh_store_id, a_qnh_store_name,
+                b_eleme_cookies, b_eleme_seller_id, b_eleme_store_id, b_eleme_store_name,
+                b_qnh_cookies, b_qnh_store_id, b_qnh_store_name,
+                sync_interval, enabled, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const result = stmt.run(
+            name,
+            config.a_eleme_cookies || '',
+            config.a_eleme_seller_id || null,
+            config.a_eleme_store_id || null,
+            config.a_eleme_store_name || null,
+            config.a_qnh_cookies || '',
+            config.a_qnh_store_id || null,
+            config.a_qnh_store_name || null,
+            config.b_eleme_cookies || '',
+            config.b_eleme_seller_id || null,
+            config.b_eleme_store_id || null,
+            config.b_eleme_store_name || null,
+            config.b_qnh_cookies || '',
+            config.b_qnh_store_id || null,
+            config.b_qnh_store_name || null,
+            config.sync_interval || 10,
+            1,
+            now,
+            now
+        );
+
+        console.log(`[Database] 添加双向同步组: ${name} (ID: ${result.lastInsertRowid})`);
+        return result.lastInsertRowid;
+    }
+
+    /**
+     * 获取双向同步组
+     * @param {number} groupId - 组ID
+     * @returns {Object|null} 组信息
+     */
+    getDualSyncGroup(groupId) {
+        const stmt = this.db.prepare('SELECT * FROM dual_sync_groups WHERE id = ?');
+        return stmt.get(groupId);
+    }
+
+    /**
+     * 获取所有双向同步组
+     * @param {boolean} enabledOnly - 是否只返回启用的组
+     * @returns {Array<Object>} 组列表
+     */
+    getAllDualSyncGroups(enabledOnly = false) {
+        let sql = 'SELECT * FROM dual_sync_groups';
+        if (enabledOnly) {
+            sql += ' WHERE enabled = 1';
+        }
+        sql += ' ORDER BY created_at DESC';
+        
+        const stmt = this.db.prepare(sql);
+        return stmt.all();
+    }
+
+    /**
+     * 更新双向同步组
+     * @param {number} groupId - 组ID
+     * @param {Object} updates - 更新字段
+     */
+    updateDualSyncGroup(groupId, updates) {
+        const allowedFields = [
+            'name',
+            'a_eleme_cookies', 'a_eleme_seller_id', 'a_eleme_store_id', 'a_eleme_store_name', 'a_eleme_cookies_valid',
+            'a_qnh_cookies', 'a_qnh_store_id', 'a_qnh_store_name', 'a_qnh_cookies_valid',
+            'b_eleme_cookies', 'b_eleme_seller_id', 'b_eleme_store_id', 'b_eleme_store_name', 'b_eleme_cookies_valid',
+            'b_qnh_cookies', 'b_qnh_store_id', 'b_qnh_store_name', 'b_qnh_cookies_valid',
+            'sync_interval', 'enabled',
+            'last_full_sync_time', 'last_full_sync_count',
+            'last_incr_sync_time', 'last_incr_sync_count',
+            'last_a_query_time', 'last_b_query_time'
+        ];
+        
+        const fields = [];
+        const values = [];
+        
+        for (const [key, value] of Object.entries(updates)) {
+            if (allowedFields.includes(key)) {
+                fields.push(`${key} = ?`);
+                values.push(value);
+            }
+        }
+        
+        if (fields.length === 0) {
+            return;
+        }
+        
+        fields.push('updated_at = ?');
+        values.push(new Date().toISOString());
+        values.push(groupId);
+        
+        const sql = `UPDATE dual_sync_groups SET ${fields.join(', ')} WHERE id = ?`;
+        const stmt = this.db.prepare(sql);
+        stmt.run(...values);
+        
+        console.log(`[Database] 更新双向同步组: ${groupId}`);
+    }
+
+    /**
+     * 删除双向同步组（级联删除相关数据）
+     * @param {number} groupId - 组ID
+     */
+    deleteDualSyncGroup(groupId) {
+        const stmt = this.db.prepare('DELETE FROM dual_sync_groups WHERE id = ?');
+        stmt.run(groupId);
+        console.log(`[Database] 删除双向同步组: ${groupId}`);
+    }
+
+    /**
+     * 复制双向同步组
+     * @param {number} sourceGroupId - 源组ID
+     * @param {string|null} newName - 新组名
+     * @returns {number} 新组ID
+     */
+    duplicateDualSyncGroup(sourceGroupId, newName = null) {
+        const source = this.getDualSyncGroup(sourceGroupId);
+        if (!source) {
+            throw new Error(`源组不存在: ${sourceGroupId}`);
+        }
+
+        const finalName = newName || `${source.name}（副本）`;
+        const now = new Date().toISOString();
+
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_groups (
+                name,
+                a_eleme_cookies, a_eleme_seller_id, a_eleme_store_id, a_eleme_store_name, a_eleme_cookies_valid,
+                a_qnh_cookies, a_qnh_store_id, a_qnh_store_name, a_qnh_cookies_valid,
+                b_eleme_cookies, b_eleme_seller_id, b_eleme_store_id, b_eleme_store_name, b_eleme_cookies_valid,
+                b_qnh_cookies, b_qnh_store_id, b_qnh_store_name, b_qnh_cookies_valid,
+                sync_interval, enabled, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const result = stmt.run(
+            finalName,
+            source.a_eleme_cookies, source.a_eleme_seller_id, source.a_eleme_store_id, source.a_eleme_store_name, source.a_eleme_cookies_valid,
+            source.a_qnh_cookies, source.a_qnh_store_id, source.a_qnh_store_name, source.a_qnh_cookies_valid,
+            source.b_eleme_cookies, source.b_eleme_seller_id, source.b_eleme_store_id, source.b_eleme_store_name, source.b_eleme_cookies_valid,
+            source.b_qnh_cookies, source.b_qnh_store_id, source.b_qnh_store_name, source.b_qnh_cookies_valid,
+            source.sync_interval, 1, now, now
+        );
+
+        console.log(`[Database] 复制双向同步组: ${sourceGroupId} -> 新ID: ${result.lastInsertRowid}`);
+        return result.lastInsertRowid;
+    }
+
+    // ==================== 双向同步历史 ====================
+
+    /**
+     * 添加双向同步历史记录
+     * @param {number} groupId - 组ID
+     * @param {string} syncType - 同步类型 (full/incremental)
+     * @param {Date} startTime - 开始时间
+     * @param {string} status - 状态
+     * @returns {number} 记录ID
+     */
+    addDualSyncHistory(groupId, syncType, startTime, status = 'running') {
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_history (
+                group_id, sync_type, start_time, status, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+        `);
+
+        const result = stmt.run(
+            groupId,
+            syncType,
+            startTime.toISOString(),
+            status,
+            new Date().toISOString()
+        );
+
+        return result.lastInsertRowid;
+    }
+
+    /**
+     * 更新双向同步历史记录
+     * @param {number} recordId - 记录ID
+     * @param {Object} updates - 更新字段
+     */
+    updateDualSyncHistory(recordId, updates) {
+        const fields = [];
+        const values = [];
+        
+        const fieldMap = {
+            endTime: 'end_time',
+            status: 'status',
+            aChanges: 'a_changes',
+            bChanges: 'b_changes',
+            totalItems: 'total_items',
+            successItems: 'success_items',
+            failedItems: 'failed_items',
+            errorMsg: 'error_msg'
+        };
+        
+        for (const [key, dbField] of Object.entries(fieldMap)) {
+            if (updates[key] !== undefined) {
+                fields.push(`${dbField} = ?`);
+                if (key === 'endTime' && updates[key] instanceof Date) {
+                    values.push(updates[key].toISOString());
+                } else {
+                    values.push(updates[key]);
+                }
+            }
+        }
+        
+        if (fields.length === 0) {
+            return;
+        }
+        
+        values.push(recordId);
+        
+        const sql = `UPDATE dual_sync_history SET ${fields.join(', ')} WHERE id = ?`;
+        const stmt = this.db.prepare(sql);
+        stmt.run(...values);
+    }
+
+    /**
+     * 获取双向同步组的历史
+     * @param {number} groupId - 组ID
+     * @param {number} limit - 限制数量
+     * @returns {Array<Object>} 历史记录列表
+     */
+    getDualSyncGroupHistory(groupId, limit = 50) {
+        const stmt = this.db.prepare(`
+            SELECT * FROM dual_sync_history
+            WHERE group_id = ?
+            ORDER BY start_time DESC
+            LIMIT ?
+        `);
+        return stmt.all(groupId, limit);
+    }
+
+    // ==================== 双向同步库存快照 ====================
+
+    /**
+     * 保存或更新库存快照
+     * @param {number} groupId - 组ID
+     * @param {string} barcode - 条形码
+     * @param {number} stock - 库存值
+     * @param {string} productName - 商品名称
+     */
+    saveDualSyncStockSnapshot(groupId, barcode, stock, productName = null) {
+        const now = new Date().toISOString();
+        
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_stock_snapshot (
+                group_id, barcode, product_name, last_known_stock, last_sync_time, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, barcode) DO UPDATE SET
+                product_name = COALESCE(excluded.product_name, product_name),
+                last_known_stock = excluded.last_known_stock,
+                last_sync_time = excluded.last_sync_time,
+                updated_at = excluded.updated_at
+        `);
+
+        stmt.run(groupId, barcode, productName, stock, now, now, now);
+    }
+
+    /**
+     * 批量保存库存快照
+     * @param {number} groupId - 组ID
+     * @param {Array<Object>} snapshots - 快照列表 [{barcode, stock, productName}]
+     */
+    saveDualSyncStockSnapshotBatch(groupId, snapshots) {
+        const now = new Date().toISOString();
+        
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_stock_snapshot (
+                group_id, barcode, product_name, last_known_stock, last_sync_time, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(group_id, barcode) DO UPDATE SET
+                product_name = COALESCE(excluded.product_name, product_name),
+                last_known_stock = excluded.last_known_stock,
+                last_sync_time = excluded.last_sync_time,
+                updated_at = excluded.updated_at
+        `);
+
+        const transaction = this.db.transaction((items) => {
+            for (const item of items) {
+                stmt.run(groupId, item.barcode, item.productName || null, item.stock, now, now, now);
+            }
+        });
+
+        transaction(snapshots);
+        console.log(`[Database] 批量保存库存快照: ${snapshots.length} 条`);
+    }
+
+    /**
+     * 获取库存快照
+     * @param {number} groupId - 组ID
+     * @param {string} barcode - 条形码（可选）
+     * @returns {Object|Array} 单个快照或快照列表
+     */
+    getDualSyncStockSnapshot(groupId, barcode = null) {
+        if (barcode) {
+            const stmt = this.db.prepare(`
+                SELECT * FROM dual_sync_stock_snapshot
+                WHERE group_id = ? AND barcode = ?
+            `);
+            return stmt.get(groupId, barcode);
+        } else {
+            const stmt = this.db.prepare(`
+                SELECT * FROM dual_sync_stock_snapshot
+                WHERE group_id = ?
+            `);
+            return stmt.all(groupId);
+        }
+    }
+
+    /**
+     * 获取库存快照映射
+     * @param {number} groupId - 组ID
+     * @returns {Object} 映射对象 {barcode: {stock, productName}}
+     */
+    getDualSyncStockSnapshotMap(groupId) {
+        const stmt = this.db.prepare(`
+            SELECT barcode, last_known_stock, product_name
+            FROM dual_sync_stock_snapshot
+            WHERE group_id = ?
+        `);
+        
+        const rows = stmt.all(groupId);
+        const mapping = {};
+        for (const row of rows) {
+            mapping[row.barcode] = {
+                stock: row.last_known_stock,
+                productName: row.product_name
+            };
+        }
+        return mapping;
+    }
+
+    /**
+     * 删除双向同步组的所有库存快照
+     * @param {number} groupId - 组ID
+     */
+    clearDualSyncStockSnapshots(groupId) {
+        const stmt = this.db.prepare('DELETE FROM dual_sync_stock_snapshot WHERE group_id = ?');
+        stmt.run(groupId);
+        console.log(`[Database] 清空双向同步组 ${groupId} 的库存快照`);
     }
 }
 

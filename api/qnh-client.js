@@ -541,6 +541,60 @@ class QianniuhuaClient {
     }
 
     /**
+     * 根据条形码批量查询商品库存（用于双向同步）
+     * @param {string} storeId - 门店ID
+     * @param {Array<string>} barcodes - 条形码列表
+     * @returns {Promise<Object>} {条形码: {skuId, stock}}，找不到则值为null
+     */
+    async getStockByBarcodes(storeId, barcodes) {
+        if (!barcodes || barcodes.length === 0) {
+            return {};
+        }
+
+        console.log(`[QNH] 批量查询 ${barcodes.length} 个条形码的库存`);
+
+        const batchSize = 50;
+        const result = {};
+
+        for (let i = 0; i < barcodes.length; i += batchSize) {
+            const batchBarcodes = barcodes.slice(i, i + batchSize);
+            const productsData = await this.getProducts(storeId, 1, 50, batchBarcodes);
+            const productList = productsData.list || [];
+
+            const foundBarcodes = new Set();
+            for (const product of productList) {
+                for (const sku of product.storeSkuList || []) {
+                    const upcList = sku.upcList || [];
+                    const skuId = String(sku.skuId);
+                    const stock = parseInt(sku.stock) || 0;
+
+                    for (const barcode of upcList) {
+                        if (batchBarcodes.includes(barcode)) {
+                            result[barcode] = {
+                                skuId: skuId,
+                                stock: stock
+                            };
+                            foundBarcodes.add(barcode);
+                        }
+                    }
+                }
+            }
+
+            // 未找到的条形码设为null
+            for (const barcode of batchBarcodes) {
+                if (!foundBarcodes.has(barcode)) {
+                    result[barcode] = null;
+                }
+            }
+        }
+
+        const foundCount = Object.values(result).filter(v => v !== null).length;
+        console.log(`[QNH] 库存查询完成: 找到 ${foundCount}/${barcodes.length} 个商品`);
+
+        return result;
+    }
+
+    /**
      * 导出门店商品列表到Excel（支持重试）
      * @param {string} storeId - 门店ID
      * @param {string} exportPath - 导出文件路径（可选）

@@ -452,6 +452,10 @@ body {
     color: #81c784;
 }
 
+.log-level-warn {
+    color: #ffb74d;
+}
+
 .log-level-error {
     color: #e57373;
 }
@@ -760,6 +764,17 @@ dialog::backdrop {
     background: #73d13d;
 }
 
+.btn-danger-light {
+    background: #fff1f0;
+    color: #cf1322;
+    border: 1px solid #ffa39e;
+}
+
+.btn-danger-light:hover {
+    background: #ffccc7;
+    border-color: #ff7875;
+}
+
 /* 配置输入框和下拉框 */
 .config-row {
     display: flex;
@@ -965,4 +980,302 @@ dialog::backdrop {
 
 .config-actions .btn:first-child {
     margin-left: 0;
+}
+
+/* ==================== 双向同步页面样式 ==================== */
+
+/* 双向同步功能说明 */
+.dual-sync-info {
+    margin-top: 16px;
+    padding: 12px;
+    background: #f6ffed;
+    border: 1px solid #b7eb8f;
+    border-radius: 8px;
+}
+
+.dual-sync-info .info-title {
+    font-weight: 600;
+    color: #52c41a;
+    margin-bottom: 8px;
+}
+
+.dual-sync-info .info-content {
+    font-size: 13px;
+    color: #595959;
+    line-height: 1.6;
+}
+
+.dual-sync-info .info-content ul {
+    margin: 8px 0 0 16px;
+    padding: 0;
+}
+
+.dual-sync-info .info-content li {
+    margin-bottom: 4px;
+}
+
+/* 双向同步组卡片 */
+.dual-sync-group-card {
+    background: white;
+    border: 1px solid #e8e8e8;
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 12px;
+    transition: all 0.3s;
+}
+
+.dual-sync-group-card:hover {
+    border-color: #1890ff;
+    box-shadow: 0 2px 8px rgba(24, 144, 255, 0.15);
+}
+
+.dual-sync-group-card.selected {
+    border-color: #1890ff;
+    background: #e6f7ff;
+}
+
+.dual-sync-group-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.dual-sync-group-name {
+    font-size: 16px;
+    font-weight: 600;
+    color: #262626;
+}
+
+.dual-sync-group-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.dual-sync-group-status {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.dual-sync-side {
+    padding: 10px;
+    background: #fafafa;
+    border-radius: 6px;
+}
+
+.dual-sync-side-label {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.dual-sync-side-label.side-a {
+    color: #1890ff;
+}
+
+.dual-sync-side-label.side-b {
+    color: #722ed1;
+}
+
+.dual-sync-side-info {
+    font-size: 12px;
+    color: #8c8c8c;
+    line-height: 1.5;
+}
+
+.dual-sync-side-info .store-name {
+    color: #262626;
+    font-weight: 500;
+}
+
+.dual-sync-group-controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding-top: 12px;
+    border-top: 1px solid #f0f0f0;
+}
+
+.dual-sync-group-controls .btn {
+    flex: 1;
+    min-width: 100px;
+}
+
+/* 同步状态标签 */
+.sync-status-tag {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.sync-status-tag.idle {
+    background: #f5f5f5;
+    color: #8c8c8c;
+}
+
+.sync-status-tag.running {
+    background: #e6f7ff;
+    color: #1890ff;
+}
+
+.sync-status-tag.scheduled {
+    background: #f6ffed;
+    color: #52c41a;
+}
+
+.sync-status-tag.error {
+    background: #fff2f0;
+    color: #ff4d4f;
+}
+
+/* 双向同步配置对话框 */
+.dialog-xlarge {
+    width: 700px;
+    max-width: 90vw;
+}
+
+.dual-sync-config-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.config-side-card {
+    border: 1px solid #e8e8e8;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.side-card-header {
+    padding: 10px 16px;
+    background: #fafafa;
+    border-bottom: 1px solid #e8e8e8;
+}
+
+.side-label {
+    font-size: 14px;
+    font-weight: 600;
+    padding: 4px 12px;
+    border-radius: 4px;
+}
+
+.side-label.side-a {
+    background: #e6f7ff;
+    color: #1890ff;
+}
+
+.side-label.side-b {
+    background: #f9f0ff;
+    color: #722ed1;
+}
+
+.side-card-content {
+    padding: 16px;
+}
+
+.config-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.config-row:last-child {
+    margin-bottom: 0;
+}
+
+.config-row .config-label {
+    width: 80px;
+    font-size: 14px;
+    color: #595959;
+    flex-shrink: 0;
+}
+
+.config-row .config-value {
+    flex: 1;
+    font-size: 13px;
+    color: #262626;
+    padding: 6px 10px;
+    background: #f5f5f5;
+    border-radius: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.config-row .config-value.valid {
+    background: #f6ffed;
+    color: #52c41a;
+}
+
+.config-row .config-value.invalid {
+    background: #fff2f0;
+    color: #ff4d4f;
+}
+
+.config-row select {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid #d9d9d9;
+    border-radius: 4px;
+    font-size: 13px;
+}
+
+.btn-small {
+    padding: 4px 12px;
+    font-size: 12px;
+}
+
+/* 上次同步信息 */
+.last-sync-info {
+    font-size: 11px;
+    color: #8c8c8c;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed #e8e8e8;
+}
+
+.last-sync-info span {
+    margin-right: 12px;
+}
+
+/* 空状态 */
+.dual-sync-empty {
+    text-align: center;
+    padding: 40px 20px;
+    color: #8c8c8c;
+}
+
+.dual-sync-empty .empty-icon {
+    font-size: 48px;
+    margin-bottom: 16px;
+}
+
+.dual-sync-empty .empty-text {
+    font-size: 14px;
+    margin-bottom: 16px;
+}
+
+/* 进度条 */
+.sync-progress-bar {
+    height: 4px;
+    background: #f0f0f0;
+    border-radius: 2px;
+    margin-top: 8px;
+    overflow: hidden;
+}
+
+.sync-progress-bar .progress-inner {
+    height: 100%;
+    background: linear-gradient(90deg, #1890ff, #52c41a);
+    border-radius: 2px;
+    transition: width 0.3s ease;
 }
