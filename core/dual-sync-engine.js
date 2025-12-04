@@ -125,6 +125,9 @@ class DualSyncEngine {
         try {
             this._log('info', '==================== 开始双向全量同步 ====================');
             this._progress(0, '开始全量同步...');
+            
+            // 初始化失败记录
+            const failedRecords = [];
 
             // 步骤1: 从A饿了么导出商品
             this._log('info', '步骤1: 从A饿了么导出商品...');
@@ -217,13 +220,71 @@ class DualSyncEngine {
                 successB = updatesB.length;
                 this._progress(85, '调试模式：跳过更新');
             } else {
-                // 步骤5: 更新B牵牛花
+                // 步骤5: 分批更新B牵牛花
                 this._log('info', '步骤5: 更新B牵牛花...');
                 this._progress(80, '更新B牵牛花...');
                 
                 if (updatesB.length > 0) {
-                    const resultB = await this.qnhB.batchUpdateMultipleSkus(this.qnhBStoreId, updatesB, '全量同步(A→B)');
-                    successB = resultB ? updatesB.length : 0;
+                    // 分批处理，每批10个商品
+                    const batchSize = 10;
+                    let failedB = 0;
+                    const totalBatches = Math.ceil(updatesB.length / batchSize);
+                    
+                    for (let i = 0; i < updatesB.length; i += batchSize) {
+                        this._checkCancelled();
+                        
+                        const batchIndex = Math.floor(i / batchSize) + 1;
+                        const batch = updatesB.slice(i, i + batchSize);
+                        const batchDetails = updateDetailsB.slice(i, i + batchSize);
+                        
+                        // 计算进度：80% - 95% 之间
+                        const currentProgress = 80 + (batchIndex / totalBatches) * 15;
+                        this._progress(currentProgress, `批量更新 ${batchIndex}/${totalBatches}`);
+                        
+                        this._log('info', `处理批次 ${batchIndex}/${totalBatches} (${batch.length} 个商品)...`);
+                        
+                        try {
+                            const success = await this.qnhB.batchUpdateMultipleSkus(
+                                this.qnhBStoreId, 
+                                batch, 
+                                `WEB-全量同步(A→B)`
+                            );
+                            
+                            if (success) {
+                                successB += batch.length;
+                                this._log('info', `批次 ${batchIndex} 更新成功`);
+                            } else {
+                                failedB += batch.length;
+                                this._log('error', `批次 ${batchIndex} 更新失败`);
+                                // 记录失败详情
+                                for (const detail of batchDetails) {
+                                    failedRecords.push({
+                                        ...detail,
+                                        direction: 'A→B',
+                                        reason: '批量更新失败'
+                                    });
+                                }
+                            }
+                        } catch (error) {
+                            this._log('error', `批次 ${batchIndex} 更新异常: ${error.message}`);
+                            failedB += batch.length;
+                            // 记录失败详情
+                            for (const detail of batchDetails) {
+                                failedRecords.push({
+                                    ...detail,
+                                    direction: 'A→B',
+                                    reason: error.message
+                                });
+                            }
+                        }
+                        
+                        // 批次间延迟，避免请求过快
+                        if (i + batchSize < updatesB.length) {
+                            await this._sleep(500);
+                        }
+                    }
+                    
+                    this._log('info', `B牵牛花更新完成: 成功 ${successB}, 失败 ${failedB}`);
                 }
             }
 
@@ -243,11 +304,18 @@ class DualSyncEngine {
             if (this.debugMode) {
                 this._log('warn', '⚠️ 调试模式：未执行实际库存更新');
             }
+            
+            // 如果有失败记录，导出到文件
+            if (failedRecords.length > 0) {
+                this._log('warn', `有 ${failedRecords.length} 个商品更新失败`);
+                this._exportFailedRecords(failedRecords);
+            }
 
             return {
                 status: 'success',
                 duration: parseFloat(duration),
-                updatesB: successB
+                updatesB: successB,
+                failedCount: failedRecords.length
             };
 
         } catch (error) {
