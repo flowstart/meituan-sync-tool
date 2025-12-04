@@ -145,6 +145,11 @@ class DualSyncEngine {
                 log: (level, msg) => this._log(level, `[A饿了么导出] ${msg}`)
             });
             
+            // 记录导出结束时间（作为后续增量同步的起点）
+            // 这个时间点之后的销售变化才需要通过增量同步处理
+            const exportEndTime = new Date();
+            this._log('info', `导出结束时间: ${exportEndTime.toISOString()}（将作为增量同步起点）`);
+            
             this._checkCancelled();
 
             // 步骤2: 解析A饿了么商品
@@ -292,8 +297,10 @@ class DualSyncEngine {
             const now = new Date();
             this.db.updateDualSyncGroup(this.groupId, {
                 last_full_sync_time: now.toISOString(),
-                last_a_query_time: now.toISOString(),
-                last_b_query_time: now.toISOString()
+                // 使用导出结束时间作为增量同步的起点
+                // 导出数据是在这个时间点的快照，之后的销售变化需要通过增量同步处理
+                last_a_query_time: exportEndTime.toISOString(),
+                last_b_query_time: exportEndTime.toISOString()
             });
 
             const duration = ((now - startTime) / 1000).toFixed(1);
