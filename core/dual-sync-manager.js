@@ -103,6 +103,15 @@ class DualSyncManager extends EventEmitter {
     }
 
     /**
+     * 刷新所有引擎配置（全局配置变更后调用）
+     */
+    refreshAllEngines() {
+        const count = this._engines.size;
+        this._engines.clear();
+        console.log(`[DualSyncManager] 已刷新所有引擎配置 (共 ${count} 个)`);
+    }
+
+    /**
      * 发送进度更新
      * @private
      */

@@ -570,7 +570,11 @@ ipcMain.handle('save-config', async (event, config) => {
         db.setConfig('debug_mode', config.debugMode.toString());
         db.setConfig('cookies_check_interval', config.cookiesCheckInterval.toString());
         
-        logger.info('全局配置已保存');
+        // 刷新所有缓存的引擎，确保使用新配置（特别是 debugMode）
+        syncManager.refreshAllEngines();
+        dualSyncManager.refreshAllEngines();
+        
+        logger.info('全局配置已保存，已刷新所有引擎');
         return { success: true };
     } catch (error) {
         logger.error('保存全局配置失败:', error);
