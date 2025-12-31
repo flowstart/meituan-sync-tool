@@ -2,6 +2,7 @@
 // 使用Electron IPC通信
 
 const { ipcRenderer } = require('electron');
+const { toLocalISOString, toLocalDateString } = require('./utils/time-utils');
 
 // 全局状态
 let groups = [];
@@ -39,6 +40,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 加载同步组数据
     loadGroups();
+    
+    // 加载双向同步组数据（默认页面为双向同步）
+    loadDualSyncGroups();
 });
 
 // ==================== 版本显示 ====================
@@ -636,8 +640,8 @@ function addLog(groupId, level, message) {
         logs[groupId] = [];
     }
 
-    // 统一保存 ISO 时间戳，渲染时再转北京时区
-    const timestamp = new Date().toISOString();
+    // 使用本地时间（北京时间）
+    const timestamp = toLocalISOString();
     logs[groupId].push({ timestamp, level, message });
 
     // 限制日志数量（最多1000条）
@@ -801,7 +805,11 @@ async function refreshFailedLogs() {
             });
             
             const groupName = log.group_name || '未知';
-            const operationType = log.operation_type === 'full_sync' ? '全量同步' : '增量同步';
+            const operationType =
+                log.operation_type === 'full_sync' ? '全量同步' :
+                log.operation_type === 'dual_full_sync' ? '双向全量同步' :
+                log.operation_type === 'dual_incr_sync' ? '双向增量同步' :
+                '增量同步';
             const oldStock = log.old_stock !== null ? log.old_stock : '-';
             const newStock = log.new_stock !== null ? log.new_stock : '-';
             const errorMsg = log.error_msg || '未知错误';
@@ -852,7 +860,11 @@ async function exportFailedLogs() {
         for (const log of logs) {
             const time = new Date(log.created_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
             const groupName = log.group_name || '未知';
-            const operationType = log.operation_type === 'full_sync' ? '全量同步' : '增量同步';
+            const operationType =
+                log.operation_type === 'full_sync' ? '全量同步' :
+                log.operation_type === 'dual_full_sync' ? '双向全量同步' :
+                log.operation_type === 'dual_incr_sync' ? '双向增量同步' :
+                '增量同步';
             const barcode = log.barcode || '-';
             const oldStock = log.old_stock !== null ? log.old_stock : '-';
             const newStock = log.new_stock !== null ? log.new_stock : '-';
@@ -866,7 +878,7 @@ async function exportFailedLogs() {
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `失败日志_${new Date().toISOString().slice(0, 10)}.csv`;
+        link.download = `失败日志_${toLocalDateString()}.csv`;
         link.click();
         URL.revokeObjectURL(url);
         
@@ -1615,6 +1627,15 @@ async function loadConfigToForm() {
         document.getElementById('debugMode').checked = config.debugMode || false;
         document.getElementById('cookiesCheckInterval').value = config.cookiesCheckInterval || 24;
         
+        // 获取并显示用户数据路径
+        try {
+            const dataPath = await ipcRequest('get-user-data-path');
+            document.getElementById('dataFilePath').value = dataPath;
+        } catch (pathError) {
+            console.error('获取数据路径失败:', pathError);
+            document.getElementById('dataFilePath').value = '获取失败';
+        }
+        
         console.log('配置已加载到表单:', config);
     } catch (error) {
         console.error('加载配置失败:', error);
@@ -1782,6 +1803,9 @@ async function loadDualSyncGroups() {
         }
         
         renderDualSyncGroups();
+        
+        // 渲染所有组的日志窗口
+        renderDualSyncLogs();
     } catch (error) {
         console.error('加载双向同步组失败:', error);
     }
@@ -1904,7 +1928,8 @@ function renderDualSyncGroupCard(group) {
 function selectDualSyncGroup(groupId) {
     currentDualSyncGroupId = groupId;
     renderDualSyncGroups();
-    loadDualSyncGroupLogs(groupId);
+    // 重新渲染日志以高亮选中的组
+    renderDualSyncLogs();
 }
 
 // 设置双向同步组运行状态
@@ -1918,8 +1943,68 @@ function setDualSyncGroupState(groupId, syncing, type = null) {
 }
 
 // 更新双向同步进度
+const DUAL_SYNC_PROGRESS_RENDER_THROTTLE_MS = 200;
+let dualSyncProgressRenderTimer = null;
+let dualSyncProgressLastRenderAt = 0;
+
+function scheduleDualSyncGroupsRender(force = false) {
+    const now = Date.now();
+
+    if (force) {
+        if (dualSyncProgressRenderTimer) {
+            clearTimeout(dualSyncProgressRenderTimer);
+            dualSyncProgressRenderTimer = null;
+        }
+        dualSyncProgressLastRenderAt = now;
+        renderDualSyncGroups();
+        return;
+    }
+
+    const elapsed = now - dualSyncProgressLastRenderAt;
+    if (elapsed >= DUAL_SYNC_PROGRESS_RENDER_THROTTLE_MS && !dualSyncProgressRenderTimer) {
+        dualSyncProgressLastRenderAt = now;
+        renderDualSyncGroups();
+        return;
+    }
+
+    if (dualSyncProgressRenderTimer) return;
+
+    const waitMs = Math.max(0, DUAL_SYNC_PROGRESS_RENDER_THROTTLE_MS - elapsed);
+    dualSyncProgressRenderTimer = setTimeout(() => {
+        dualSyncProgressRenderTimer = null;
+        dualSyncProgressLastRenderAt = Date.now();
+        renderDualSyncGroups();
+    }, waitMs);
+}
+
 function updateDualSyncProgress(groupId, progress, message) {
-    renderDualSyncGroups();
+    const force = progress === 0 || progress === 100 || progress === -1;
+    scheduleDualSyncGroupsRender(force);
+    updateDualSyncLogProgressUI(groupId, progress, message);
+}
+
+function updateDualSyncLogProgressUI(groupId, progress, message) {
+    const progressEl = document.getElementById(`dualSyncLogProgress_${groupId}`);
+    if (!progressEl) return;
+
+    const fillEl = progressEl.querySelector('.dual-sync-log-progress-inner');
+    const textEl = progressEl.querySelector('.dual-sync-log-progress-text');
+    if (!fillEl || !textEl) return;
+
+    // 显示/隐藏逻辑：同步进行中显示；完成/失败也短暂显示（不刷屏）
+    const shouldShow = progress !== null && progress !== undefined && progress !== -1;
+    progressEl.style.display = shouldShow ? '' : 'none';
+
+    if (progress === -1) {
+        progressEl.style.display = 'none';
+        return;
+    }
+
+    const safeProgress = Math.min(100, Math.max(0, Number(progress) || 0));
+    fillEl.style.width = `${safeProgress}%`;
+
+    const msg = message || '';
+    textEl.textContent = msg ? `${safeProgress}% · ${msg}` : `${safeProgress}%`;
 }
 
 // 添加双向同步日志
@@ -1936,10 +2021,8 @@ function addDualSyncLog(groupId, level, message) {
         dualSyncLogs[groupId].shift();
     }
     
-    // 如果是当前选中的组，更新日志显示
-    if (currentDualSyncGroupId === groupId) {
-        renderDualSyncLogs(groupId);
-    }
+    // 更新日志显示（所有组的日志都需要显示）
+    renderDualSyncLogs(groupId);
 }
 
 // 加载双向同步组日志
@@ -1957,54 +2040,80 @@ async function loadDualSyncGroupLogs(groupId) {
     }
 }
 
-// 渲染双向同步日志
+// 渲染双向同步日志（渲染所有组的日志卡片，顺序与左侧组列表一致）
 function renderDualSyncLogs(groupId) {
     const container = document.getElementById('dualSyncLogsContainer');
     if (!container) return;
 
-    const logList = dualSyncLogs[groupId] || [];
-    const group = dualSyncGroups.find(g => g.id === groupId);
-    const groupName = group ? group.name : `组 ${groupId}`;
-    
-    // 使用和工作状态页面一样的 log-card 结构
-    const contentHtml = logList.length > 0
-        ? logList.map(log => {
-            // 检测 [!red] 标记，用红色显示
-            let message = log.message;
-            let messageStyle = '';
-            if (message.startsWith('[!red]')) {
-                message = message.replace('[!red]', '');
-                messageStyle = 'color: #e57373;';
-            }
-            return `
-                <div class="log-line">
-                    <span class="log-time">${log.timestamp}</span> |
-                    <span class="log-level-${log.level}">${log.level.toUpperCase()}</span> |
-                    <span style="${messageStyle}">${message}</span>
-                </div>
-            `;
-        }).join('')
-        : `<div class="log-line" style="color: #8c8c8c;">暂无日志，开始同步后将在此显示</div>`;
-
-    container.innerHTML = `
-        <div class="log-card">
-            <div class="log-header">
-                <div class="log-title">📋 ${groupName}</div>
-                <div class="log-actions">
-                    <button class="log-btn" onclick="clearDualSyncLogs()">清空</button>
-                </div>
+    // 无组时展示占位
+    if (!dualSyncGroups || dualSyncGroups.length === 0) {
+        container.innerHTML = `
+            <div class="no-logs">
+                <p>暂无日志</p>
+                <p style="font-size: 12px; color: #8c8c8c;">开始同步后将显示实时日志</p>
             </div>
-            <div class="log-content" id="dualSyncLogContent">
-                ${contentHtml}
-            </div>
-        </div>
-    `;
-
-    // 滚动到底部
-    const logContent = document.getElementById('dualSyncLogContent');
-    if (logContent) {
-        logContent.scrollTop = logContent.scrollHeight;
+        `;
+        return;
     }
+
+    // 日志面板顺序：与左侧组列表一致
+    const orderedGroups = dualSyncGroups.slice();
+
+    container.innerHTML = orderedGroups.map(group => {
+        const gId = group.id;
+        const groupName = group.name || `组 ${gId}`;
+        const logList = dualSyncLogs[gId] || [];
+        const isSelected = currentDualSyncGroupId === gId;
+        const state = dualSyncRunningStates[gId] || {};
+        const initialProgress = state.progress ?? 0;
+        const initialMessage = state.message || '';
+        const showProgress = state.syncing;
+
+        const contentHtml = logList.length > 0
+            ? logList.map(log => {
+                // 检测 [!red] 标记，用红色显示
+                let message = log.message;
+                let messageStyle = '';
+                if (message.startsWith('[!red]')) {
+                    message = message.replace('[!red]', '');
+                    messageStyle = 'color: #e57373;';
+                }
+                return `
+                    <div class="log-line">
+                        <span class="log-time">${log.timestamp}</span> |
+                        <span class="log-level-${log.level}">${log.level.toUpperCase()}</span> |
+                        <span style="${messageStyle}">${message}</span>
+                    </div>
+                `;
+            }).join('')
+            : `<div class="log-line" style="color: #8c8c8c;">暂无日志，开始同步后将在此显示</div>`;
+
+        return `
+            <div class="log-card ${isSelected ? 'selected' : ''}" data-group-id="${gId}">
+                <div class="log-header">
+                    <div class="log-title">📋 ${groupName}</div>
+                    <div class="log-actions">
+                        <button class="log-btn" onclick="clearDualSyncLogsForGroup(${gId})">清空</button>
+                    </div>
+                </div>
+                <div class="log-content" id="dualSyncLogContent_${gId}">
+                    <div class="dual-sync-log-progress" id="dualSyncLogProgress_${gId}" style="${showProgress ? '' : 'display:none;'}">
+                        <div class="dual-sync-log-progress-bar">
+                            <div class="dual-sync-log-progress-inner" style="width: ${Math.min(100, Math.max(0, Number(initialProgress) || 0))}%"></div>
+                        </div>
+                        <div class="dual-sync-log-progress-text">${initialMessage ? `${Math.min(100, Math.max(0, Number(initialProgress) || 0))}% · ${initialMessage}` : `${Math.min(100, Math.max(0, Number(initialProgress) || 0))}%`}</div>
+                    </div>
+                    ${contentHtml}
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    // 自动滚动到每个日志卡片的底部
+    const logCards = container.querySelectorAll('.log-content');
+    logCards.forEach(card => {
+        card.scrollTop = card.scrollHeight;
+    });
 }
 
 // 打开双向同步配置对话框
@@ -2037,9 +2146,10 @@ async function openDualSyncConfigDialog(groupId = null) {
                 const aSelect = document.getElementById('dualSyncAQnhStoreSelect');
                 aRow.style.display = 'flex';
                 
-                // 如果有已选门店，先显示
+                // 如果有已选门店，先显示（格式：门店名称 (ID: xxx)）
                 if (group.a_qnh_store_id) {
-                    aSelect.innerHTML = `<option value="">选择门店...</option><option value="${group.a_qnh_store_id}" selected>${group.a_qnh_store_name || group.a_qnh_store_id}</option>`;
+                    const displayName = group.a_qnh_store_name ? `${group.a_qnh_store_name} (ID: ${group.a_qnh_store_id})` : group.a_qnh_store_id;
+                    aSelect.innerHTML = `<option value="">选择门店...</option><option value="${group.a_qnh_store_id}" data-name="${group.a_qnh_store_name || ''}" selected>${displayName}</option>`;
                 }
             } else {
                 document.getElementById('dualSyncAQnhStoreRow').style.display = 'none';
@@ -2052,7 +2162,8 @@ async function openDualSyncConfigDialog(groupId = null) {
                 bRow.style.display = 'flex';
                 
                 if (group.b_qnh_store_id) {
-                    bSelect.innerHTML = `<option value="">选择门店...</option><option value="${group.b_qnh_store_id}" selected>${group.b_qnh_store_name || group.b_qnh_store_id}</option>`;
+                    const displayName = group.b_qnh_store_name ? `${group.b_qnh_store_name} (ID: ${group.b_qnh_store_id})` : group.b_qnh_store_id;
+                    bSelect.innerHTML = `<option value="">选择门店...</option><option value="${group.b_qnh_store_id}" data-name="${group.b_qnh_store_name || ''}" selected>${displayName}</option>`;
                 }
             } else {
                 document.getElementById('dualSyncBQnhStoreRow').style.display = 'none';
@@ -2162,7 +2273,7 @@ async function saveDualSyncConfig() {
 }
 
 // 配置双向同步Cookie
-function configureDualSyncCookie(side, type) {
+async function configureDualSyncCookie(side, type) {
     if (!currentDualSyncGroupId) {
         // 先保存组
         saveDualSyncConfigAndContinue(side, type);
@@ -2180,7 +2291,20 @@ function configureDualSyncCookie(side, type) {
     
     title.textContent = `🍪 配置${sideLabel}${typeLabel}Cookie`;
     label.textContent = `${typeLabel}Cookie字符串：`;
-    document.getElementById('dualSyncCookieInput').value = '';
+    
+    // 回显已保存的 Cookie
+    let existingCookies = '';
+    try {
+        const group = await ipcRenderer.invoke('dual-sync-get-group', currentDualSyncGroupId);
+        if (group) {
+            // 根据 side 和 type 获取对应的 Cookie
+            const cookieKey = `${side}_${type}_cookies`;
+            existingCookies = group[cookieKey] || '';
+        }
+    } catch (error) {
+        console.error('获取已保存Cookie失败:', error);
+    }
+    document.getElementById('dualSyncCookieInput').value = existingCookies;
     
     dialog.showModal();
 }
@@ -2259,7 +2383,7 @@ async function confirmDualSyncCookie() {
                 const row = document.getElementById(rowId);
                 
                 select.innerHTML = '<option value="">选择门店...</option>' + 
-                    result.stores.map(s => `<option value="${s.id}">${s.name}</option>`).join('');
+                    result.stores.map(s => `<option value="${s.id}" data-name="${s.name}">${s.name} (ID: ${s.id})</option>`).join('');
                 row.style.display = 'flex';
                 
                 alert(`✅ ${side === 'a' ? 'A方' : 'B方'}牵牛花验证成功\n请选择门店`);
@@ -2284,7 +2408,9 @@ async function selectDualSyncStore(side) {
     const selectId = `dualSync${side.toUpperCase()}QnhStoreSelect`;
     const select = document.getElementById(selectId);
     const storeId = select.value;
-    const storeName = select.options[select.selectedIndex].text;
+    // 从 data-name 属性获取纯门店名称（不含ID后缀）
+    const selectedOption = select.options[select.selectedIndex];
+    const storeName = selectedOption.dataset.name || selectedOption.text;
     
     if (!storeId) return;
     
@@ -2338,7 +2464,7 @@ async function refreshDualSyncQnhStores(side) {
             const currentStoreId = group[`${side}_qnh_store_id`];
             
             select.innerHTML = '<option value="">选择门店...</option>' + 
-                result.stores.map(s => `<option value="${s.id}" ${s.id === currentStoreId ? 'selected' : ''}>${s.name}</option>`).join('');
+                result.stores.map(s => `<option value="${s.id}" data-name="${s.name}" ${s.id === currentStoreId ? 'selected' : ''}>${s.name} (ID: ${s.id})</option>`).join('');
             row.style.display = 'flex';
             
             alert(`✅ 刷新成功，获取到 ${result.stores.length} 个门店`);
@@ -2461,23 +2587,34 @@ async function cancelDualSync(groupId) {
     }
 }
 
-// 刷新双向同步日志
-function refreshDualSyncLogs() {
-    if (currentDualSyncGroupId) {
-        loadDualSyncGroupLogs(currentDualSyncGroupId);
+// 刷新双向同步日志（刷新所有组）
+async function refreshDualSyncLogs() {
+    for (const group of dualSyncGroups) {
+        await loadDualSyncGroupLogs(group.id);
     }
 }
 
-// 清空双向同步日志
+// 清空双向同步日志（清空所有组）
 async function clearDualSyncLogs() {
-    if (currentDualSyncGroupId) {
+    for (const group of dualSyncGroups) {
         try {
-            await ipcRenderer.invoke('dual-sync-clear-logs', { groupId: currentDualSyncGroupId });
-            dualSyncLogs[currentDualSyncGroupId] = [];
-            renderDualSyncLogs(currentDualSyncGroupId);
+            await ipcRenderer.invoke('dual-sync-clear-logs', { groupId: group.id });
+            dualSyncLogs[group.id] = [];
         } catch (error) {
-            console.error('清空日志失败:', error);
+            console.error(`清空组 ${group.id} 日志失败:`, error);
         }
+    }
+    renderDualSyncLogs();
+}
+
+// 清空指定组的双向同步日志
+async function clearDualSyncLogsForGroup(groupId) {
+    try {
+        await ipcRenderer.invoke('dual-sync-clear-logs', { groupId });
+        dualSyncLogs[groupId] = [];
+        renderDualSyncLogs();
+    } catch (error) {
+        console.error(`清空组 ${groupId} 日志失败:`, error);
     }
 }
 
@@ -2512,3 +2649,4 @@ window.stopDualSyncScheduled = stopDualSyncScheduled;
 window.cancelDualSync = cancelDualSync;
 window.refreshDualSyncLogs = refreshDualSyncLogs;
 window.clearDualSyncLogs = clearDualSyncLogs;
+window.clearDualSyncLogsForGroup = clearDualSyncLogsForGroup;

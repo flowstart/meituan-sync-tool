@@ -7,6 +7,7 @@ const ElemeClient = require('../api/eleme-client');
 const createQnhClient = require('../api/qnh-client-factory');
 const ProductMatcher = require('./product-matcher');
 const { ElemeParser, QianniuhuaParser } = require('../utils/parsers');
+const { toLocalISOString } = require('../utils/time-utils');
 const path = require('path');
 const fs = require('fs');
 
@@ -237,7 +238,7 @@ class SyncEngine {
                     const exportCreatedAt = new Date(elemeExportJob.gmtCreate.replace(/-/g, '/'));
                     if (!isNaN(exportCreatedAt.getTime())) {
                         this.db.updateGroup(this.groupId, {
-                            last_full_export_time: exportCreatedAt.toISOString()
+                            last_full_export_time: toLocalISOString(exportCreatedAt)
                         });
                         this._log('info', `记录全量导出创建时间: ${this._formatBeijing(exportCreatedAt)}`);
                     } else {
@@ -818,7 +819,7 @@ class SyncEngine {
                 // 调试模式下同样写入“本次增量查询开始时间”，用于下次作为起点
                 try {
                     this.db.updateGroup(this.groupId, {
-                        last_incr_query_started_at: thisIncrQueryStartedAt.toISOString()
+                        last_incr_query_started_at: toLocalISOString(thisIncrQueryStartedAt)
                     });
                 } catch (e) {
                     this._log('warn', `写入增量查询开始时间失败: ${e.message}`);
@@ -954,7 +955,7 @@ class SyncEngine {
             // 成功后写入“本次增量查询开始时间”，用于下次起点
             try {
                 this.db.updateGroup(this.groupId, {
-                    last_incr_query_started_at: thisIncrQueryStartedAt.toISOString()
+                    last_incr_query_started_at: toLocalISOString(thisIncrQueryStartedAt)
                 });
             } catch (e) {
                 this._log('warn', `写入增量查询开始时间失败: ${e.message}`);

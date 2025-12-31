@@ -3,6 +3,8 @@
  * 负责：商品从A后台搬运到B后台（完整流程）
  */
 
+const { toLocalISOString } = require('../../utils/time-utils');
+
 class TransferModule {
     /**
      * 构造函数
@@ -315,7 +317,7 @@ class TransferModule {
                 poiId: d.sourcePoiId,
                 spuId: d.sourceSpuId,
                 error: d.error,
-                timestamp: new Date().toISOString()
+                timestamp: toLocalISOString()
             }));
 
         // 确保目录存在
@@ -325,7 +327,7 @@ class TransferModule {
         }
 
         fs.writeFileSync(filePath, JSON.stringify(failedProducts, null, 2), 'utf8');
-        console.log(`[QNH Transfer] 失败商品列表已导出到: ${filePath}`);
+        console.log(`[QNH Transfer] 失败商品列表已导出到: "${filePath}"`);
 
         return filePath;
     }

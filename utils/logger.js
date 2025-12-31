@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { toLocalISOString, toLocalDateString } = require('./time-utils');
 
 class Logger {
     constructor(options = {}) {
@@ -54,7 +55,7 @@ class Logger {
      * 获取当前日志文件路径
      */
     _getLogFilePath() {
-        const today = new Date().toISOString().split('T')[0];
+        const today = toLocalDateString();
         return path.join(this.logDir, `app-${today}.log`);
     }
 
@@ -62,7 +63,7 @@ class Logger {
      * 格式化日志消息
      */
     _formatMessage(level, ...args) {
-        const timestamp = new Date().toISOString();
+        const timestamp = toLocalISOString();
         const message = args.map(arg => {
             if (typeof arg === 'object') {
                 try {

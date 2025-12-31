@@ -105,14 +105,27 @@ class ElemeParser {
                 op_time: opTime,
                 op_user: opLog.opUser || '',
                 op_content: opContent,
-                stock_change: null
+                stock_change: null,
+                stock_changes_by_barcode: null,  // 多规格商品的库存变化
+                is_multi_spec: false  // 是否是多规格商品
             };
 
             // 如果是修改门店商品，解析库存变化
             if (opType === '修改门店商品' && opContent.includes('库存')) {
-                const stockChange = ElemeParser.parseStockChange(opContent);
-                if (stockChange) {
-                    result.stock_change = stockChange;
+                // 先尝试解析多规格商品
+                const multiSpecChanges = ElemeParser.parseMultiSpecStockChanges(opContent);
+                if (multiSpecChanges && Object.keys(multiSpecChanges).length > 0) {
+                    result.stock_changes_by_barcode = multiSpecChanges;
+                    result.is_multi_spec = true;
+                    // 为了兼容，取第一个规格的变化作为 stock_change
+                    const firstBarcode = Object.keys(multiSpecChanges)[0];
+                    result.stock_change = multiSpecChanges[firstBarcode];
+                } else {
+                    // 单规格商品，使用原有逻辑
+                    const stockChange = ElemeParser.parseStockChange(opContent);
+                    if (stockChange) {
+                        result.stock_change = stockChange;
+                    }
                 }
             }
 
@@ -153,6 +166,51 @@ class ElemeParser {
 
         } catch (error) {
             console.debug('[ElemeParser] 解析库存变化失败:', error);
+            return null;
+        }
+    }
+
+    /**
+     * 解析多规格商品的库存变化
+     * 格式：多规格商品条形码：xxx<br/>---原信息---<br/>库存：n；<br/>---新信息---<br/>库存：m；
+     * @param {string} opContent - 操作内容（HTML格式）
+     * @returns {Object|null} {barcode: {old_stock, new_stock, change}, ...}
+     */
+    static parseMultiSpecStockChanges(opContent) {
+        try {
+            // 检查是否包含多规格商品标记
+            if (!opContent.includes('多规格商品条形码')) {
+                return null;
+            }
+
+            const result = {};
+            
+            // 匹配每个规格的库存变化
+            // 格式：多规格商品条形码：xxx ... 原信息 ... 库存：n ... 新信息 ... 库存：m
+            const specPattern = /多规格商品条形码[：:]\s*(\d+).*?原信息.*?库存[：:]\s*(\d+).*?新信息.*?库存[：:]\s*(\d+)/g;
+            
+            let match;
+            while ((match = specPattern.exec(opContent)) !== null) {
+                const barcode = match[1];
+                const oldStock = parseInt(match[2]);
+                const newStock = parseInt(match[3]);
+                
+                result[barcode] = {
+                    old_stock: oldStock,
+                    new_stock: newStock,
+                    change: newStock - oldStock
+                };
+            }
+
+            // 如果解析到了多规格数据，返回结果
+            if (Object.keys(result).length > 0) {
+                return result;
+            }
+
+            return null;
+
+        } catch (error) {
+            console.debug('[ElemeParser] 解析多规格库存变化失败:', error);
             return null;
         }
     }

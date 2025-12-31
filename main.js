@@ -440,7 +440,8 @@ ipcMain.handle('get-operation-logs', async (event, { groupId, limit = 100 }) => 
         if (groupId) {
             return db.getGroupLogs(groupId, limit);
         } else {
-            return db.getRecentLogs(limit);
+            // 全部组：合并单向 + 双向失败日志
+            return db.getRecentFailedLogsCombined(limit);
         }
     } catch (error) {
         logger.error('获取操作日志失败:', error);
@@ -560,6 +561,11 @@ ipcMain.handle('get-config', async () => {
         logger.error('获取全局配置失败:', error);
         throw error;
     }
+});
+
+// 获取用户数据目录路径
+ipcMain.handle('get-user-data-path', () => {
+    return path.join(app.getPath('userData'), 'data');
 });
 
 // 保存全局配置
@@ -709,7 +715,9 @@ ipcMain.handle('dual-sync-full', async (event, { groupId, options = {} }) => {
 ipcMain.handle('dual-sync-incremental', async (event, { groupId }) => {
     try {
         logger.info(`开始双向增量同步: 组${groupId}`);
-        const result = await dualSyncManager.incrementalSync(groupId);
+        // 传入用户数据目录下的 data 子目录，避免打包后路径问题
+        const exportDir = path.join(app.getPath('userData'), 'data');
+        const result = await dualSyncManager.incrementalSync(groupId, { exportDir });
         logger.info(`双向增量同步完成: 组${groupId}, 结果: ${result.status}`);
         return result;
     } catch (error) {
@@ -736,7 +744,9 @@ ipcMain.handle('dual-sync-cancel', async (event, { groupId }) => {
 // 启动定时任务
 ipcMain.handle('dual-sync-start-scheduled', (event, { groupId, intervalMinutes = 10, runImmediately = true }) => {
     try {
-        dualSyncManager.startScheduledSync(groupId, intervalMinutes, { runImmediately });
+        // 传入用户数据目录下的 data 子目录，避免打包后路径问题
+        const exportDir = path.join(app.getPath('userData'), 'data');
+        dualSyncManager.startScheduledSync(groupId, intervalMinutes, { runImmediately, exportDir });
         logger.info(`双向同步定时任务启动: 组${groupId}, 间隔${intervalMinutes}分钟`);
         return { success: true };
     } catch (error) {

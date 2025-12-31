@@ -5,6 +5,7 @@
 
 const EventEmitter = require('events');
 const SyncEngine = require('./sync-engine');
+const { toLocalISOString } = require('../utils/time-utils');
 const path = require('path');
 const fs = require('fs');
 
@@ -146,7 +147,7 @@ class SyncManager extends EventEmitter {
             
             const dateStr = this._getDateStr();
             const logFile = path.join(logDir, `group_${groupId}_${dateStr}.log`);
-            const logLine = `[${logEntry.timestamp.toISOString()}] [${level.toUpperCase()}] ${message}\n`;
+            const logLine = `[${toLocalISOString(logEntry.timestamp)}] [${level.toUpperCase()}] ${message}\n`;
             
             fs.appendFileSync(logFile, logLine);
         } catch (error) {
@@ -201,10 +202,10 @@ class SyncManager extends EventEmitter {
                                  : (result.affectedProducts ?? result.successItems ?? 0);
                     const fields = {};
                     if (syncType === 'full') {
-                        fields.last_full_sync_time = end.toISOString();
+                        fields.last_full_sync_time = toLocalISOString(end);
                         fields.last_full_sync_count = count;
                     } else {
-                        fields.last_incr_sync_time = end.toISOString();
+                        fields.last_incr_sync_time = toLocalISOString(end);
                         fields.last_incr_sync_count = count;
                     }
                     this.db.updateGroup(groupId, fields);

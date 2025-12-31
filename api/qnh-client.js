@@ -1108,8 +1108,9 @@ class QianniuhuaClient {
             console.log(`[QNH] 批量更新成功: 门店=${storeId}, SKU数量=${skuList.length}`);
             return true;
         } catch (error) {
+            // 不吞错：把具体 API 错误向上抛出，方便同步引擎记录到失败原因/失败日志
             console.error(`[QNH] 批量更新失败: ${error.message}`);
-            return false;
+            throw error;
         }
     }
 
@@ -1370,6 +1371,407 @@ class QianniuhuaClient {
                 error: error.message || '网络请求失败'
             };
         }
+    }
+
+    // ========================================
+    // 盘点单相关 API
+    // ========================================
+
+    /**
+     * 查询盘点单列表
+     * @param {string|number} poiId - 门店ID
+     * @param {number} startTime - 开始时间戳（毫秒）- 创建时间范围
+     * @param {number} endTime - 结束时间戳（毫秒）- 创建时间范围
+     * @param {number} page - 页码
+     * @param {number} pageSize - 每页数量
+     * @param {number} status - 盘点单状态（5=已完成）
+     * @returns {Promise<Object>} 盘点单列表
+     */
+    async getInventoryTaskList(poiId, startTime, endTime, page = 1, pageSize = 10, status = 5) {
+        const url = 'https://qnh.meituan.com/api/v1/stockTask/tasklist?yodaReady=h5&csecplatform=4&csecversion=4.0.4';
+        const poiIdNum = typeof poiId === 'string' ? parseInt(poiId) : poiId;
+        
+        const data = {
+            poiIdList: [poiIdNum],
+            status: status,  // 只查已完成的盘点单
+            page: page,
+            pageSize: pageSize,
+            sorter: {},
+            startTime: startTime,
+            endTime: endTime
+        };
+
+        const result = await this._request('POST', url, data);
+        return result;
+    }
+
+    /**
+     * 获取所有盘点单（自动分页）
+     * @param {string|number} poiId - 门店ID
+     * @param {number} startTime - 开始时间戳（毫秒）
+     * @param {number} endTime - 结束时间戳（毫秒）
+     * @returns {Promise<Array>} 所有盘点单
+     */
+    async getAllInventoryTasks(poiId, startTime, endTime) {
+        const allTasks = [];
+        let page = 1;
+        const pageSize = 50;
+
+        while (true) {
+            const result = await this.getInventoryTaskList(poiId, startTime, endTime, page, pageSize);
+            const tasks = result.data?.list || [];
+            allTasks.push(...tasks);
+
+            const total = result.data?.total || 0;
+            if (allTasks.length >= total || tasks.length === 0) {
+                break;
+            }
+            page++;
+        }
+
+        console.log(`[QNH] 盘点单查询完成: 共 ${allTasks.length} 条`);
+        return allTasks;
+    }
+
+    /**
+     * 查询盘点单商品明细
+     * @param {string|number} poiId - 门店ID
+     * @param {string} taskNo - 盘点单号
+     * @param {string|number} entityType - 实体类型（从盘点单列表返回获取）
+     * @param {number} page - 页码
+     * @param {number} pageSize - 每页数量
+     * @returns {Promise<Object>} 商品明细
+     */
+    async getInventoryTaskGoods(poiId, taskNo, entityType = 3, page = 1, pageSize = 50) {
+        const url = 'https://qnh.meituan.com/api/v1/stockTask/taskGoodsList?yodaReady=h5&csecplatform=4&csecversion=4.0.4';
+        const poiIdStr = String(poiId);
+        
+        const data = {
+            page: page,
+            pageSize: pageSize,
+            sorter: {},
+            poiId: poiIdStr,
+            taskNo: taskNo,
+            entityId: poiIdStr,
+            entityType: String(entityType),  // 使用动态 entityType
+            poiName: ''
+        };
+
+        const result = await this._request('POST', url, data);
+        return result;
+    }
+
+    /**
+     * 获取盘点单的所有商品明细（自动分页）
+     * @param {string|number} poiId - 门店ID
+     * @param {string} taskNo - 盘点单号
+     * @param {string|number} entityType - 实体类型（从盘点单列表返回获取）
+     * @returns {Promise<Array>} 所有商品明细
+     */
+    async getAllInventoryTaskGoods(poiId, taskNo, entityType = 3) {
+        const allGoods = [];
+        let page = 1;
+        const pageSize = 50;
+
+        while (true) {
+            const result = await this.getInventoryTaskGoods(poiId, taskNo, entityType, page, pageSize);
+            const goods = result.data?.list || [];
+            allGoods.push(...goods);
+
+            const total = result.data?.total || 0;
+            if (allGoods.length >= total || goods.length === 0) {
+                break;
+            }
+            page++;
+        }
+
+        console.log(`[QNH] 盘点单 ${taskNo} 商品明细查询完成: 共 ${allGoods.length} 个商品`);
+        return allGoods;
+    }
+
+    /**
+     * 获取指定完结时间范围内的所有盘点库存变化
+     * 返回格式: { barcode: { totalChange: number, logs: [...] } }
+     * @param {string|number} poiId - 门店ID
+     * @param {number} finishStartTime - 完结时间起始（毫秒）
+     * @param {number} finishEndTime - 完结时间结束（毫秒）
+     * @param {number} createStartTime - 创建时间起始（毫秒），默认30天前
+     * @returns {Promise<Object>} 按条形码汇总的库存变化
+     */
+    async getInventoryChanges(poiId, finishStartTime, finishEndTime, createStartTime = null) {
+        console.log(`[QNH] 查询门店 ${poiId} 盘点变化(完结时间): ${new Date(finishStartTime).toLocaleString()} ~ ${new Date(finishEndTime).toLocaleString()}`);
+        
+        // 创建时间范围：默认查30天内创建的盘点单
+        const now = Date.now();
+        const createStart = createStartTime || (now - 30 * 24 * 60 * 60 * 1000);
+        const createEnd = now;
+        
+        const allChanges = {};
+        let page = 1;
+        const pageSize = 50;
+        let processedCount = 0;
+        let shouldContinue = true;
+
+        while (shouldContinue) {
+            const result = await this.getInventoryTaskList(poiId, createStart, createEnd, page, pageSize);
+            const tasks = result.data?.list || [];
+            
+            if (tasks.length === 0) break;
+
+            for (const task of tasks) {
+                // 获取完结时间（operationProgressInfo.operateTime）
+                const finishTime = task.operationProgressInfo?.operateTime;
+                
+                // 列表按时间倒序，完结时间早于起始时间时可提前终止
+                if (finishTime && finishTime < finishStartTime) {
+                    console.log(`[QNH] 盘点单 ${task.taskNo} 完结时间 ${new Date(finishTime).toLocaleString()} 早于查询起始时间，停止遍历`);
+                    shouldContinue = false;
+                    break;
+                }
+
+                // 只处理完结时间在范围内的盘点单
+                if (task.taskNo && finishTime && finishTime >= finishStartTime && finishTime <= finishEndTime) {
+                    console.log(`[QNH] 处理盘点单 ${task.taskNo} (完结时间: ${new Date(finishTime).toLocaleString()})`);
+                    const goodsList = await this.getAllInventoryTaskGoods(poiId, task.taskNo, task.entityType);
+                    processedCount++;
+                    
+                    for (const goods of goodsList) {
+                        // 条形码在 upcList 数组中，只取第一个（避免多条形码重复计算）
+                        const upcList = goods.upcList || [];
+                        const barcode = upcList[0]; // 只用第一个条形码
+                        // stockNo: 原库存, checkStockNo: 盘点后库存
+                        const oldStock = parseInt(goods.stockNo) || 0;
+                        const newStock = parseInt(goods.checkStockNo) || 0;
+                        
+                        if (barcode) {
+                            const change = newStock - oldStock;
+                            if (change !== 0) { // 只记录有变化的
+                                if (!allChanges[barcode]) {
+                                    allChanges[barcode] = { totalChange: 0, logs: [] };
+                                }
+                                allChanges[barcode].totalChange += change;
+                                allChanges[barcode].logs.push({
+                                    taskNo: task.taskNo,
+                                    taskName: task.taskName,
+                                    skuName: goods.skuName,
+                                    barcode: barcode,
+                                    beforeStock: oldStock,
+                                    afterStock: newStock,
+                                    change: change,
+                                    finishTime: finishTime
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 检查是否需要继续分页
+            const total = result.data?.total || 0;
+            if (page * pageSize >= total) break;
+            page++;
+        }
+
+        console.log(`[QNH] 门店 ${poiId} 处理了 ${processedCount} 个盘点单，共汇总 ${Object.keys(allChanges).length} 个商品的盘点变化`);
+        return allChanges;
+    }
+
+    // ========================================
+    // 收货单相关 API
+    // ========================================
+
+    /**
+     * 查询收货单列表
+     * @param {string|number} warehouseId - 仓库ID
+     * @param {number} createStartTime - 创建时间起始（毫秒）
+     * @param {number} createEndTime - 创建时间结束（毫秒）
+     * @param {number} finishStartTime - 完结时间起始（毫秒），可选
+     * @param {number} finishEndTime - 完结时间结束（毫秒），可选
+     * @param {number} page - 页码
+     * @param {number} pageSize - 每页数量
+     * @returns {Promise<Object>} 收货单列表
+     */
+    async getReceiptOrderList(warehouseId, createStartTime, createEndTime, finishStartTime = null, finishEndTime = null, page = 1, pageSize = 10) {
+        const url = 'https://qnh.meituan.com/qnh-gw2/wms/inbound/receipt/front/order/list?yodaReady=h5&csecplatform=4&csecversion=4.0.4';
+        const warehouseIdNum = typeof warehouseId === 'string' ? parseInt(warehouseId) : warehouseId;
+        
+        const query = {
+            warehouseIds: [warehouseIdNum],
+            inboundOrderNos: [],
+            scOrderNoList: [],
+            transportTrackingNoOrBookingOrderNoListKeyword: [],
+            createTimeRange: {
+                startTimeInMillis: createStartTime,
+                endTimeInMillis: createEndTime
+            }
+        };
+        
+        // 添加完结时间范围过滤（如果提供）
+        if (finishStartTime && finishEndTime) {
+            query.finishTimeRange = {
+                startTimeInMillis: finishStartTime,
+                endTimeInMillis: finishEndTime
+            };
+        }
+        
+        const data = {
+            page: page,
+            pageSize: pageSize,
+            query: query
+        };
+
+        const result = await this._request('POST', url, data);
+        return result;
+    }
+
+    /**
+     * 获取所有收货单（自动分页）
+     * @param {string|number} warehouseId - 仓库ID
+     * @param {number} createStartTime - 创建时间起始（毫秒）
+     * @param {number} createEndTime - 创建时间结束（毫秒）
+     * @param {number} finishStartTime - 完结时间起始（毫秒），可选
+     * @param {number} finishEndTime - 完结时间结束（毫秒），可选
+     * @returns {Promise<Array>} 所有收货单
+     */
+    async getAllReceiptOrders(warehouseId, createStartTime, createEndTime, finishStartTime = null, finishEndTime = null) {
+        const allOrders = [];
+        let page = 1;
+        const pageSize = 50;
+
+        while (true) {
+            const result = await this.getReceiptOrderList(warehouseId, createStartTime, createEndTime, finishStartTime, finishEndTime, page, pageSize);
+            const orders = result.data?.list || [];
+            allOrders.push(...orders);
+
+            const total = result.data?.total || 0;
+            if (allOrders.length >= total || orders.length === 0) {
+                break;
+            }
+            page++;
+        }
+
+        console.log(`[QNH] 收货单查询完成: 共 ${allOrders.length} 条`);
+        return allOrders;
+    }
+
+    /**
+     * 查询收货单商品明细
+     * @param {string|number} warehouseId - 仓库ID
+     * @param {string} inboundOrderNo - 收货单号
+     * @param {number} page - 页码
+     * @param {number} pageSize - 每页数量
+     * @returns {Promise<Object>} 商品明细
+     */
+    async getReceiptOrderItems(warehouseId, inboundOrderNo, page = 1, pageSize = 50) {
+        const url = 'https://qnh.meituan.com/qnh-gw2/wms/inbound/receipt/order/items?yodaReady=h5&csecplatform=4&csecversion=4.0.4';
+        const warehouseIdNum = typeof warehouseId === 'string' ? parseInt(warehouseId) : warehouseId;
+        
+        const data = {
+            warehouseId: warehouseIdNum,
+            inboundOrderNo: inboundOrderNo,
+            queryCmd: {
+                page: page,
+                pageSize: pageSize,
+                query: {}
+            }
+        };
+
+        const result = await this._request('POST', url, data);
+        return result;
+    }
+
+    /**
+     * 获取收货单的所有商品明细（自动分页）
+     * @param {string|number} warehouseId - 仓库ID
+     * @param {string} inboundOrderNo - 收货单号
+     * @returns {Promise<Array>} 所有商品明细
+     */
+    async getAllReceiptOrderItems(warehouseId, inboundOrderNo) {
+        const allItems = [];
+        let page = 1;
+        const pageSize = 50;
+
+        while (true) {
+            const result = await this.getReceiptOrderItems(warehouseId, inboundOrderNo, page, pageSize);
+            const items = result.data?.list || [];
+            allItems.push(...items);
+
+            const total = result.data?.total || 0;
+            if (allItems.length >= total || items.length === 0) {
+                break;
+            }
+            page++;
+        }
+
+        console.log(`[QNH] 收货单 ${inboundOrderNo} 商品明细查询完成: 共 ${allItems.length} 个商品`);
+        return allItems;
+    }
+
+    /**
+     * 获取指定完结时间范围内的所有收货库存变化
+     * 返回格式: { barcode: { totalChange: number, logs: [...] } }
+     * @param {string|number} warehouseId - 仓库ID
+     * @param {number} finishStartTime - 完结时间起始（毫秒）
+     * @param {number} finishEndTime - 完结时间结束（毫秒）
+     * @returns {Promise<Object>} 按条形码汇总的库存变化
+     */
+    async getReceiptChanges(warehouseId, finishStartTime, finishEndTime) {
+        console.log(`[QNH] 查询仓库 ${warehouseId} 收货变化(完结时间): ${new Date(finishStartTime).toLocaleString()} ~ ${new Date(finishEndTime).toLocaleString()}`);
+        
+        // 创建时间范围：固定查30天
+        const now = Date.now();
+        const createStartTime = now - 30 * 24 * 60 * 60 * 1000;
+        const createEndTime = now;
+        
+        // 通过 finishTimeRange 过滤后获取所有符合条件的收货单
+        const allOrders = await this.getAllReceiptOrders(
+            warehouseId, 
+            createStartTime, 
+            createEndTime, 
+            finishStartTime, 
+            finishEndTime
+        );
+        
+        const allChanges = {};
+        let processedCount = 0;
+
+        for (const order of allOrders) {
+            const orderNo = order.inboundOrderNo;
+            const finishTime = order.timeInfo?.finishTimeInMillis;
+
+            // 接口已通过 finishTimeRange 过滤，直接处理
+            if (orderNo) {
+                console.log(`[QNH] 处理收货单 ${orderNo} (完结时间: ${finishTime ? new Date(finishTime).toLocaleString() : '未知'})`);
+                const itemsList = await this.getAllReceiptOrderItems(warehouseId, orderNo);
+                processedCount++;
+                
+                for (const item of itemsList) {
+                    // 条形码在 goodsInfo.upcList 中，只取第一个（避免多条形码重复计算）
+                    const upcList = item.goodsInfo?.upcList || [];
+                    const barcode = upcList[0]; // 只用第一个条形码
+                    // 收货数量在 quantityInfo.receivedQuantityOfBaseUnit
+                    const receivedQty = parseInt(item.quantityInfo?.receivedQuantityOfBaseUnit) || 0;
+                    const goodsName = item.goodsInfo?.goodsName || '';
+                    
+                    if (barcode && receivedQty > 0) {
+                        if (!allChanges[barcode]) {
+                            allChanges[barcode] = { totalChange: 0, logs: [] };
+                        }
+                        allChanges[barcode].totalChange += receivedQty;
+                        allChanges[barcode].logs.push({
+                            orderNo: orderNo,
+                            goodsName: goodsName,
+                            barcode: barcode,
+                            receivedQty: receivedQty,
+                            finishTime: finishTime
+                        });
+                    }
+                }
+            }
+        }
+
+        console.log(`[QNH] 仓库 ${warehouseId} 处理了 ${processedCount} 个收货单，共汇总 ${Object.keys(allChanges).length} 个商品的收货变化`);
+        return allChanges;
     }
 }
 

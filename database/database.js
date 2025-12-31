@@ -6,6 +6,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const { toLocalISOString } = require('../utils/time-utils');
 
 class SyncDatabase {
     /**
@@ -109,6 +110,23 @@ class SyncDatabase {
             )
         `);
 
+        // 4.1 双向同步操作日志表（独立表，外键指向 dual_sync_groups）
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_operation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                operation_type TEXT NOT NULL,
+                barcode TEXT,
+                old_stock INTEGER,
+                new_stock INTEGER,
+                store_id TEXT,
+                success INTEGER DEFAULT 1,
+                error_msg TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
         // 5. 配置表（全局配置）
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS config (
@@ -198,6 +216,23 @@ class SyncDatabase {
             )
         `);
 
+        // 8.1 双向同步：写入指纹记录表（用于过滤工具同步回流的饿了么 API 操作记录）
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_applied_change (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sync_run_id INTEGER,
+                direction TEXT,
+                dest_side TEXT NOT NULL, -- A / B，表示该写入会回流到哪一侧的饿了么操作记录
+                barcode TEXT NOT NULL,
+                old_stock INTEGER,
+                new_stock INTEGER,
+                applied_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
         // 9. 数据库迁移：添加缺失的列（向后兼容）
         this._migrateDatabase();
 
@@ -209,10 +244,14 @@ class SyncDatabase {
             CREATE INDEX IF NOT EXISTS idx_product_mapping_barcode ON product_mapping(eleme_barcode);
             CREATE INDEX IF NOT EXISTS idx_operation_log_group ON operation_log(group_id);
             CREATE INDEX IF NOT EXISTS idx_operation_log_time ON operation_log(created_at);
+            CREATE INDEX IF NOT EXISTS idx_dual_operation_log_group ON dual_operation_log(group_id);
+            CREATE INDEX IF NOT EXISTS idx_dual_operation_log_time ON dual_operation_log(created_at);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_history_group ON dual_sync_history(group_id);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_history_time ON dual_sync_history(start_time);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_stock_group ON dual_sync_stock_snapshot(group_id);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_stock_barcode ON dual_sync_stock_snapshot(barcode);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_applied_change_group_side_time ON dual_sync_applied_change(group_id, dest_side, applied_at);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_applied_change_fingerprint ON dual_sync_applied_change(group_id, dest_side, barcode, old_stock, new_stock);
         `);
     }
 
@@ -256,6 +295,31 @@ class SyncDatabase {
                     console.log(`[Database] ⏭️  列已存在: ${column.name}`);
                 }
             }
+
+            // 检查 dual_sync_groups 表的列（双向同步专用）
+            const dualTableInfo = this.db.prepare("PRAGMA table_info(dual_sync_groups)").all();
+            const dualExistingColumns = new Set(dualTableInfo.map(col => col.name));
+
+            const dualColumnsToAdd = [
+                { name: 'last_a_apply_start_time', type: 'TEXT' },
+                { name: 'last_a_apply_end_time', type: 'TEXT' },
+                { name: 'last_b_apply_start_time', type: 'TEXT' },
+                { name: 'last_b_apply_end_time', type: 'TEXT' }
+            ];
+
+            for (const column of dualColumnsToAdd) {
+                if (!dualExistingColumns.has(column.name)) {
+                    try {
+                        const sql = `ALTER TABLE dual_sync_groups ADD COLUMN ${column.name} ${column.type}`;
+                        this.db.exec(sql);
+                        console.log(`[Database] ✅ 添加列(dual): ${column.name}`);
+                    } catch (error) {
+                        console.error(`[Database] ❌ 添加列失败(dual) (${column.name}):`, error.message);
+                    }
+                } else {
+                    console.log(`[Database] ⏭️  列已存在(dual): ${column.name}`);
+                }
+            }
             
             console.log('[Database] 数据库迁移完成');
         } catch (error) {
@@ -273,7 +337,7 @@ class SyncDatabase {
      * @returns {number} 组ID
      */
     addGroup(name, elemeConfig, qnhConfig) {
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
         const stmt = this.db.prepare(`
             INSERT INTO sync_groups (
                 name, eleme_cookies, eleme_seller_id, eleme_store_id,
@@ -311,7 +375,7 @@ class SyncDatabase {
 
         // 生成新名称
         let name = newName && newName.trim() ? newName.trim() : `${source.name}（副本）`;
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
 
         // 插入新记录（保留Cookies与饿了么门店，清空牵牛花门店，状态字段复位）
         const stmt = this.db.prepare(`
@@ -406,7 +470,7 @@ class SyncDatabase {
         }
         
         fields.push('updated_at = ?');
-        values.push(new Date().toISOString());
+        values.push(toLocalISOString());
         values.push(groupId);
         
         const sql = `UPDATE sync_groups SET ${fields.join(', ')} WHERE id = ?`;
@@ -446,9 +510,9 @@ class SyncDatabase {
         const result = stmt.run(
             groupId,
             syncType,
-            startTime.toISOString(),
+            toLocalISOString(startTime),
             status,
-            new Date().toISOString()
+            toLocalISOString()
         );
 
         return result.lastInsertRowid;
@@ -476,7 +540,7 @@ class SyncDatabase {
             if (updates[key] !== undefined) {
                 fields.push(`${dbField} = ?`);
                 if (key === 'endTime' && updates[key] instanceof Date) {
-                    values.push(updates[key].toISOString());
+                    values.push(toLocalISOString(updates[key]));
                 } else {
                     values.push(updates[key]);
                 }
@@ -537,7 +601,7 @@ class SyncDatabase {
      * @param {string} qnhProductName - 牵牛花商品名
      */
     saveProductMapping(groupId, elemeBarcode, qnhSkuId, elemeProductName = null, qnhProductName = null) {
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
         
         const stmt = this.db.prepare(`
             INSERT INTO product_mapping (
@@ -628,7 +692,39 @@ class SyncDatabase {
             storeId,
             success ? 1 : 0,
             errorMsg,
-            new Date().toISOString()
+            toLocalISOString()
+        );
+    }
+
+    /**
+     * 添加双向同步操作日志（仅失败记录也可写入）
+     * @param {number} groupId - 双向同步组ID
+     * @param {string} operationType - 操作类型
+     * @param {string} barcode - 条形码
+     * @param {number|null} oldStock - 旧库存
+     * @param {number|null} newStock - 新库存
+     * @param {string} storeId - 门店ID
+     * @param {boolean} success - 是否成功
+     * @param {string|null} errorMsg - 错误信息
+     */
+    addDualOperationLog(groupId, operationType, barcode, oldStock, newStock, storeId, success = true, errorMsg = null) {
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_operation_log (
+                group_id, operation_type, barcode, old_stock, new_stock,
+                store_id, success, error_msg, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        stmt.run(
+            groupId,
+            operationType,
+            barcode,
+            oldStock,
+            newStock,
+            storeId,
+            success ? 1 : 0,
+            errorMsg,
+            toLocalISOString()
         );
     }
 
@@ -665,6 +761,53 @@ class SyncDatabase {
         return stmt.all(limit);
     }
 
+    /**
+     * 获取最近失败日志（单向 + 双向，合并）
+     * @param {number} limit - 限制数量
+     * @returns {Array<Object>} 日志列表
+     */
+    getRecentFailedLogsCombined(limit = 100) {
+        const stmt = this.db.prepare(`
+            SELECT *
+            FROM (
+                SELECT
+                    l.id,
+                    l.group_id,
+                    l.operation_type,
+                    l.barcode,
+                    l.old_stock,
+                    l.new_stock,
+                    l.store_id,
+                    l.success,
+                    l.error_msg,
+                    l.created_at AS created_at,
+                    g.name AS group_name
+                FROM operation_log l
+                LEFT JOIN sync_groups g ON l.group_id = g.id
+                WHERE l.success = 0
+                UNION ALL
+                SELECT
+                    dl.id,
+                    dl.group_id,
+                    dl.operation_type,
+                    dl.barcode,
+                    dl.old_stock,
+                    dl.new_stock,
+                    dl.store_id,
+                    dl.success,
+                    dl.error_msg,
+                    dl.created_at AS created_at,
+                    dg.name AS group_name
+                FROM dual_operation_log dl
+                LEFT JOIN dual_sync_groups dg ON dl.group_id = dg.id
+                WHERE dl.success = 0
+            )
+            ORDER BY created_at DESC
+            LIMIT ?
+        `);
+        return stmt.all(limit);
+    }
+
     // ==================== 配置管理 ====================
 
     /**
@@ -683,7 +826,7 @@ class SyncDatabase {
                 updated_at = excluded.updated_at
         `);
 
-        stmt.run(key, value, description, new Date().toISOString());
+        stmt.run(key, value, description, toLocalISOString());
     }
 
     /**
@@ -779,7 +922,7 @@ class SyncDatabase {
      * @returns {number} 组ID
      */
     addDualSyncGroup(name, config = {}) {
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
         const stmt = this.db.prepare(`
             INSERT INTO dual_sync_groups (
                 name,
@@ -858,7 +1001,10 @@ class SyncDatabase {
             'sync_interval', 'enabled',
             'last_full_sync_time', 'last_full_sync_count',
             'last_incr_sync_time', 'last_incr_sync_count',
-            'last_a_query_time', 'last_b_query_time'
+            'last_a_query_time', 'last_b_query_time',
+            // 工具写入窗口（用于过滤饿了么回流 API 操作记录）
+            'last_a_apply_start_time', 'last_a_apply_end_time',
+            'last_b_apply_start_time', 'last_b_apply_end_time'
         ];
         
         const fields = [];
@@ -876,7 +1022,7 @@ class SyncDatabase {
         }
         
         fields.push('updated_at = ?');
-        values.push(new Date().toISOString());
+        values.push(toLocalISOString());
         values.push(groupId);
         
         const sql = `UPDATE dual_sync_groups SET ${fields.join(', ')} WHERE id = ?`;
@@ -909,7 +1055,7 @@ class SyncDatabase {
         }
 
         const finalName = newName || `${source.name}（副本）`;
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
 
         const stmt = this.db.prepare(`
             INSERT INTO dual_sync_groups (
@@ -955,9 +1101,9 @@ class SyncDatabase {
         const result = stmt.run(
             groupId,
             syncType,
-            startTime.toISOString(),
+            toLocalISOString(startTime),
             status,
-            new Date().toISOString()
+            toLocalISOString()
         );
 
         return result.lastInsertRowid;
@@ -987,7 +1133,7 @@ class SyncDatabase {
             if (updates[key] !== undefined) {
                 fields.push(`${dbField} = ?`);
                 if (key === 'endTime' && updates[key] instanceof Date) {
-                    values.push(updates[key].toISOString());
+                    values.push(toLocalISOString(updates[key]));
                 } else {
                     values.push(updates[key]);
                 }
@@ -1003,6 +1149,90 @@ class SyncDatabase {
         const sql = `UPDATE dual_sync_history SET ${fields.join(', ')} WHERE id = ?`;
         const stmt = this.db.prepare(sql);
         stmt.run(...values);
+    }
+
+    // ==================== 双向同步：工具写入指纹（用于过滤饿了么回流） ====================
+
+    /**
+     * 批量写入“工具写入造成的库存变更指纹”
+     * @param {number} groupId - 双向同步组ID
+     * @param {number|null} syncRunId - dual_sync_history.id（可为空）
+     * @param {string} destSide - 'A' | 'B'（回流会出现在该侧饿了么）
+     * @param {string} direction - 方向标识（如 'A->B' / 'B->A'）
+     * @param {Array<Object>} items - [{barcode, oldStock, newStock, appliedAt}]
+     */
+    addDualSyncAppliedChanges(groupId, syncRunId, destSide, direction, items) {
+        if (!items || items.length === 0) return;
+
+        const now = toLocalISOString();
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_applied_change (
+                group_id, sync_run_id, direction, dest_side,
+                barcode, old_stock, new_stock, applied_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const transaction = this.db.transaction((rows) => {
+            for (const row of rows) {
+                stmt.run(
+                    groupId,
+                    syncRunId || null,
+                    direction || null,
+                    destSide,
+                    row.barcode,
+                    row.oldStock,
+                    row.newStock,
+                    row.appliedAt || now,
+                    now
+                );
+            }
+        });
+
+        transaction(items);
+
+        // 轻量清理：保留最近7天（避免表无限增长）
+        try {
+            const cutoff = toLocalISOString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000));
+            this.db.prepare(`
+                DELETE FROM dual_sync_applied_change
+                WHERE group_id = ? AND applied_at < ?
+            `).run(groupId, cutoff);
+        } catch (e) {
+            // 清理失败不影响主流程
+        }
+    }
+
+    /**
+     * 获取指定时间窗内的指纹集合（用于过滤饿了么操作记录回流）
+     * @param {number} groupId - 双向同步组ID
+     * @param {string} destSide - 'A' | 'B'
+     * @param {string} windowStartIso - 起始时间（toLocalISOString 格式）
+     * @param {string} windowEndIso - 结束时间（toLocalISOString 格式）
+     * @returns {Set<string>} 指纹集合，形如 `${barcode}_${old}_${new}`
+     */
+    getDualSyncAppliedFingerprints(groupId, destSide, windowStartIso, windowEndIso) {
+        if (!windowStartIso || !windowEndIso) {
+            return new Set();
+        }
+
+        const stmt = this.db.prepare(`
+            SELECT barcode, old_stock, new_stock
+            FROM dual_sync_applied_change
+            WHERE group_id = ?
+              AND dest_side = ?
+              AND applied_at >= ?
+              AND applied_at <= ?
+              AND barcode IS NOT NULL
+              AND old_stock IS NOT NULL
+              AND new_stock IS NOT NULL
+        `);
+
+        const rows = stmt.all(groupId, destSide, windowStartIso, windowEndIso);
+        const set = new Set();
+        for (const row of rows) {
+            set.add(`${row.barcode}_${row.old_stock}_${row.new_stock}`);
+        }
+        return set;
     }
 
     /**
@@ -1031,7 +1261,7 @@ class SyncDatabase {
      * @param {string} productName - 商品名称
      */
     saveDualSyncStockSnapshot(groupId, barcode, stock, productName = null) {
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
         
         const stmt = this.db.prepare(`
             INSERT INTO dual_sync_stock_snapshot (
@@ -1053,7 +1283,7 @@ class SyncDatabase {
      * @param {Array<Object>} snapshots - 快照列表 [{barcode, stock, productName}]
      */
     saveDualSyncStockSnapshotBatch(groupId, snapshots) {
-        const now = new Date().toISOString();
+        const now = toLocalISOString();
         
         const stmt = this.db.prepare(`
             INSERT INTO dual_sync_stock_snapshot (

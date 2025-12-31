@@ -5,6 +5,7 @@
 
 const EventEmitter = require('events');
 const DualSyncEngine = require('./dual-sync-engine');
+const { toLocalISOString } = require('../utils/time-utils');
 const path = require('path');
 const fs = require('fs');
 
@@ -155,7 +156,7 @@ class DualSyncManager extends EventEmitter {
             
             const dateStr = this._getDateStr();
             const logFile = path.join(logDir, `dual_group_${groupId}_${dateStr}.log`);
-            const logLine = `[${logEntry.timestamp.toISOString()}] [${level.toUpperCase()}] ${message}\n`;
+            const logLine = `[${toLocalISOString(logEntry.timestamp)}] [${level.toUpperCase()}] ${message}\n`;
             
             fs.appendFileSync(logFile, logLine);
         } catch (error) {
@@ -213,7 +214,7 @@ class DualSyncManager extends EventEmitter {
     /**
      * 执行增量同步
      */
-    async incrementalSync(groupId) {
+    async incrementalSync(groupId, options = {}) {
         try {
             const engine = this._getOrCreateEngine(groupId);
             
@@ -221,7 +222,7 @@ class DualSyncManager extends EventEmitter {
             this._running.set(groupId, { type: 'incremental' });
             this.emit('sync-started', { groupId, type: 'incremental' });
             
-            const result = await engine.incrementalSync();
+            const result = await engine.incrementalSync(options.exportDir);
             
             if (result.status === 'success') {
                 this._emitLog(groupId, 'info', '增量同步成功');
@@ -306,6 +307,7 @@ class DualSyncManager extends EventEmitter {
 
         const intervalMs = intervalMinutes * 60 * 1000;
         const runImmediately = options.runImmediately !== undefined ? !!options.runImmediately : true;
+        const exportDir = options.exportDir; // 保存导出目录
 
         this._emitLog(groupId, 'info', `启动定时任务，间隔: ${intervalMinutes}分钟${runImmediately ? '（立即执行一次）' : ''}`);
 
@@ -331,7 +333,7 @@ class DualSyncManager extends EventEmitter {
             this._emitLog(groupId, 'info', `定时增量同步开始 (间隔: ${intervalMinutes}分钟)`);
             
             try {
-                const result = await this.incrementalSync(groupId);
+                const result = await this.incrementalSync(groupId, { exportDir });
                 
                 if (result.status === 'success') {
                     this._emitLog(groupId, 'info', '定时增量同步完成');
@@ -344,11 +346,35 @@ class DualSyncManager extends EventEmitter {
                     return;
                 } else {
                     this._emitLog(groupId, 'error', `定时增量同步失败: ${result.error || '未知错误'}`);
+                    
+                    // 检查是否为认证类错误（Cookie过期等），如果是则停止定时任务
+                    const errorMsg = result.error || '';
+                    if (errorMsg.includes('登录状态无效') || 
+                        errorMsg.includes('已过期') || 
+                        errorMsg.includes('code: 102') ||
+                        errorMsg.includes('认证失败') ||
+                        errorMsg.includes('未登录')) {
+                        this._emitLog(groupId, 'error', 'Cookie已过期或无效，已停止定时任务，请更新Cookie后重新启动');
+                        this.stopScheduledSync(groupId);
+                        return;
+                    }
                 }
             } catch (error) {
                 this._emitLog(groupId, 'error', `定时增量同步异常: ${error.message}`);
+                
+                // 检查异常信息是否为认证类错误
+                const errorMsg = error.message || '';
+                if (errorMsg.includes('登录状态无效') || 
+                    errorMsg.includes('已过期') || 
+                    errorMsg.includes('code: 102') ||
+                    errorMsg.includes('认证失败') ||
+                    errorMsg.includes('未登录')) {
+                    this._emitLog(groupId, 'error', 'Cookie已过期或无效，已停止定时任务，请更新Cookie后重新启动');
+                    this.stopScheduledSync(groupId);
+                    return;
+                }
             } finally {
-                // 记录下次执行时间
+                // 记录下次执行时间（只有任务未被停止时才显示）
                 if (this._scheduledTasks.has(groupId)) {
                     const next = new Date(Date.now() + intervalMs);
                     this._emitLog(groupId, 'info', `下次定时同步时间: ${toBeijing(next)}`);

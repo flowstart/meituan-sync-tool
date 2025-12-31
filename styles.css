@@ -392,6 +392,11 @@ body {
     overflow: hidden;
 }
 
+.log-card.selected {
+    border-color: #1890ff;
+    box-shadow: 0 0 0 2px rgba(24, 144, 255, 0.2);
+}
+
 .log-header {
     padding: 10px 15px;
     background: #fafafa;
@@ -434,6 +439,39 @@ body {
     max-height: 300px;
     overflow-y: auto;
     line-height: 1.6;
+}
+
+.dual-sync-log-progress {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: #1e1e1e;
+    padding: 8px 0 10px 0;
+    margin: -10px -15px 8px -15px; /* 抵消 .log-content 的 padding，使其贴边并可 sticky */
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.dual-sync-log-progress-bar {
+    height: 6px;
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 0 15px;
+}
+
+.dual-sync-log-progress-inner {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #1890ff, #40a9ff);
+    transition: width 0.2s ease;
+}
+
+.dual-sync-log-progress-text {
+    margin-top: 6px;
+    padding: 0 15px;
+    font-size: 11px;
+    color: #a6a6a6;
+    font-family: 'Courier New', monospace;
 }
 
 .log-line {

@@ -95,8 +95,9 @@ class StockModule {
             console.log(`[QNH Stock] 批量更新成功: 门店=${storeId}, SKU数量=${skuList.length}`);
             return true;
         } catch (error) {
+            // 不吞错：把具体错误向上抛出，便于同步引擎记录失败原因
             console.error(`[QNH Stock] 批量更新失败: ${error.message}`);
-            return false;
+            throw error;
         }
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "meituan-sync-tool",
-  "version": "1.0.4",
+  "version": "1.0.6",
   "description": "美团同步工具 - 饿了么到牵牛花库存同步",
   "main": "main.js",
   "scripts": {
