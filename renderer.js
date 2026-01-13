@@ -1910,11 +1910,16 @@ function renderDualSyncGroupCard(group) {
                 ${configComplete ? `
                     ${isRunning ? `
                         <button class="btn btn-danger" onclick="event.stopPropagation(); cancelDualSync(${group.id})">⏹️ 停止</button>
+                        ${isScheduled ? `
+                            <button class="btn btn-danger-light" onclick="event.stopPropagation(); stopDualSyncScheduledSafe(${group.id})">⏸️ 停止定时(安全)</button>
+                        ` : ''}
                     ` : isScheduled ? `
                         <button class="btn btn-danger-light" onclick="event.stopPropagation(); stopDualSyncScheduled(${group.id})">⏸️ 停止定时</button>
+                        <button class="btn btn-secondary" onclick="event.stopPropagation(); openTraceQueryDialog(${group.id})" title="库存追溯查询">🔍 追溯</button>
                     ` : `
                         <button class="btn btn-primary" onclick="event.stopPropagation(); startDualSyncFull(${group.id})">🔄 全量同步</button>
                         <button class="btn btn-success" onclick="event.stopPropagation(); startDualSyncScheduled(${group.id}, ${group.sync_interval || 10})">▶️ 启动定时</button>
+                        <button class="btn btn-secondary" onclick="event.stopPropagation(); openTraceQueryDialog(${group.id})" title="库存追溯查询">🔍 追溯</button>
                     `}
                 ` : `
                     <button class="btn btn-warning" onclick="event.stopPropagation(); openDualSyncConfigDialog(${group.id})">⚠️ 完成配置</button>
@@ -2577,6 +2582,24 @@ async function stopDualSyncScheduled(groupId) {
     }
 }
 
+// 安全停止双向定时同步：查询阶段会取消本轮；写入阶段默认仅停止后续定时
+async function stopDualSyncScheduledSafe(groupId) {
+    if (!confirm('确定要停止定时同步吗？（查询阶段将安全取消本轮，写入阶段默认不取消本轮）')) return;
+
+    try {
+        const res = await ipcRenderer.invoke('dual-sync-stop-scheduled-safe', { groupId });
+        if (res && res.success) {
+            dualSyncScheduledTasks[groupId] = false;
+            renderDualSyncGroups();
+            addDualSyncLog(groupId, 'info', '定时同步已停止（安全模式）');
+        } else {
+            throw new Error((res && res.error) ? res.error : '未知错误');
+        }
+    } catch (error) {
+        alert('安全停止定时同步失败: ' + error.message);
+    }
+}
+
 // 取消双向同步
 async function cancelDualSync(groupId) {
     try {
@@ -2646,7 +2669,309 @@ window.duplicateDualSyncGroup = duplicateDualSyncGroup;
 window.startDualSyncFull = startDualSyncFull;
 window.startDualSyncScheduled = startDualSyncScheduled;
 window.stopDualSyncScheduled = stopDualSyncScheduled;
+window.stopDualSyncScheduledSafe = stopDualSyncScheduledSafe;
 window.cancelDualSync = cancelDualSync;
 window.refreshDualSyncLogs = refreshDualSyncLogs;
 window.clearDualSyncLogs = clearDualSyncLogs;
 window.clearDualSyncLogsForGroup = clearDualSyncLogsForGroup;
+window.openTraceQueryDialog = openTraceQueryDialog;
+window.closeTraceQueryDialog = closeTraceQueryDialog;
+window.executeTraceQuery = executeTraceQuery;
+window.exportTraceData = exportTraceData;
+window.viewTraceDetail = viewTraceDetail;
+window.closeTraceDetailDialog = closeTraceDetailDialog;
+window.copyTraceDetail = copyTraceDetail;
+
+// ==================== 追溯查询功能 ====================
+
+let currentTraceGroupId = null;
+let currentTraceBarcode = null;
+let currentTraceDetailData = null;
+
+// 打开追溯查询对话框
+function openTraceQueryDialog(groupId) {
+    currentTraceGroupId = groupId;
+    currentTraceBarcode = null;
+    
+    const dialog = document.getElementById('traceQueryDialog');
+    const barcodeInput = document.getElementById('traceBarcodeInput');
+    const resultContainer = document.getElementById('traceQueryResult');
+    
+    // 重置状态
+    barcodeInput.value = '';
+    resultContainer.innerHTML = `
+        <div style="text-align: center; color: #999; padding: 40px;">
+            <p>请输入条形码查询商品的同步历史</p>
+            <p style="font-size: 12px; margin-top: 8px;">将自动从最近一次全量同步开始追溯</p>
+        </div>
+    `;
+    
+    dialog.showModal();
+}
+
+// 关闭追溯查询对话框
+function closeTraceQueryDialog() {
+    const dialog = document.getElementById('traceQueryDialog');
+    dialog.close();
+    currentTraceGroupId = null;
+}
+
+// 执行追溯查询
+async function executeTraceQuery() {
+    const barcode = document.getElementById('traceBarcodeInput').value.trim();
+    const resultContainer = document.getElementById('traceQueryResult');
+    
+    if (!barcode) {
+        alert('请输入条形码');
+        return;
+    }
+    
+    currentTraceBarcode = barcode;
+    resultContainer.innerHTML = '<div style="text-align: center; padding: 20px; color: #999;">查询中...</div>';
+    
+    try {
+        const result = await ipcRenderer.invoke('dual-sync-get-trace-by-barcode', {
+            groupId: currentTraceGroupId,
+            barcode: barcode
+        });
+        
+        if (!result.success) {
+            resultContainer.innerHTML = `<div style="color: #f5222d; padding: 20px;">查询失败: ${result.error}</div>`;
+            return;
+        }
+        
+        renderTraceQueryResult(result.data, barcode);
+    } catch (error) {
+        resultContainer.innerHTML = `<div style="color: #f5222d; padding: 20px;">查询失败: ${error.message}</div>`;
+    }
+}
+
+// 渲染追溯查询结果
+function renderTraceQueryResult(data, barcode) {
+    const resultContainer = document.getElementById('traceQueryResult');
+    const { fullSyncBaseline, incrementalRecords, isFullSyncOlderThan30Days } = data;
+    
+    let html = '';
+    
+    // 30天警告提示
+    if (isFullSyncOlderThan30Days) {
+        html += `
+            <div style="background: #fff7e6; border: 1px solid #ffd591; border-radius: 4px; padding: 12px; margin-bottom: 15px;">
+                <span style="color: #fa8c16;">⚠️ 数据仅保留30天，只能查询近30天的记录</span>
+            </div>
+        `;
+    }
+    
+    // 商品信息
+    const productName = fullSyncBaseline?.product_name || incrementalRecords[0]?.product_name || '未知商品';
+    html += `
+        <div style="background: #f5f5f5; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
+            <div style="font-size: 14px; font-weight: bold;">商品条形码: ${barcode}</div>
+            <div style="font-size: 13px; color: #666; margin-top: 4px;">商品名称: ${productName}</div>
+        </div>
+    `;
+    
+    // 全量同步基准
+    if (fullSyncBaseline) {
+        const time = new Date(fullSyncBaseline.created_at).toLocaleString('zh-CN');
+        const baseStock = fullSyncBaseline.current_stock ?? fullSyncBaseline.target_stock ?? '-';
+        html += `
+            <div style="background: #e6f7ff; border: 1px solid #91d5ff; border-radius: 4px; padding: 12px; margin-bottom: 15px;">
+                <div style="font-weight: bold; margin-bottom: 8px;">📌 全量同步基准</div>
+                <div>时间: ${time}</div>
+                <div>基准库存: <strong style="color: #1890ff; font-size: 16px;">${baseStock}</strong></div>
+            </div>
+        `;
+    } else {
+        html += `
+            <div style="background: #fffbe6; border: 1px solid #ffe58f; border-radius: 4px; padding: 12px; margin-bottom: 15px;">
+                <span style="color: #d48806;">⚠️ 未找到该商品的全量同步记录</span>
+            </div>
+        `;
+    }
+    
+    // 增量同步记录
+    if (incrementalRecords.length > 0) {
+        html += `
+            <div style="font-weight: bold; margin-bottom: 10px;">📋 增量同步记录 (${incrementalRecords.length}条)</div>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                    <tr style="background: #fafafa;">
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: left;">时间</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">方向</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: right;">变化量</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">过滤</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">去重</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">结果</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: right;">目标库存</th>
+                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">详情</th>
+                    </tr>
+                </thead>
+                <tbody>
+        `;
+        
+        for (const record of incrementalRecords) {
+            const time = new Date(record.created_at).toLocaleString('zh-CN');
+            const direction = record.direction === 'A->B' ? 'A→B' : 'B→A';
+            const change = record.source_total_change;
+            const changeColor = change > 0 ? 'green' : (change < 0 ? 'red' : 'gray');
+            const changeText = change > 0 ? `+${change}` : `${change}`;
+            const wasFiltered = record.was_filtered ? '是' : '否';
+            const wasDeduplicated = record.was_deduplicated ? '是' : '否';
+            
+            let resultStyle = '';
+            let resultText = record.apply_result;
+            switch (record.apply_result) {
+                case 'success':
+                    resultStyle = 'color: #52c41a; font-weight: bold;';
+                    resultText = '成功';
+                    break;
+                case 'failed':
+                    resultStyle = 'color: #f5222d; font-weight: bold;';
+                    resultText = '失败';
+                    break;
+                case 'filtered':
+                    resultStyle = 'color: #faad14;';
+                    resultText = '已过滤';
+                    break;
+                case 'deduplicated':
+                    resultStyle = 'color: #722ed1;';
+                    resultText = '已去重';
+                    break;
+            }
+            
+            html += `
+                <tr>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8;">${time}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">${direction}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: right; color: ${changeColor};">${changeText}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center; ${record.was_filtered ? 'color: #faad14;' : ''}">${wasFiltered}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center; ${record.was_deduplicated ? 'color: #722ed1;' : ''}">${wasDeduplicated}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center; ${resultStyle}">${resultText}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: right;">${record.target_stock ?? '-'}</td>
+                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">
+                        <button class="btn btn-small" onclick="viewTraceDetail(${record.sync_run_id})" title="查看详细日志">📄</button>
+                    </td>
+                </tr>
+            `;
+        }
+        
+        html += '</tbody></table>';
+        
+        // 计算理论库存
+        if (fullSyncBaseline) {
+            const baseStock = fullSyncBaseline.current_stock ?? fullSyncBaseline.target_stock ?? 0;
+            let totalChange = 0;
+            for (const record of incrementalRecords) {
+                if (record.apply_result === 'success') {
+                    totalChange += record.source_total_change || 0;
+                }
+            }
+            const theoreticalStock = baseStock + totalChange;
+            
+            html += `
+                <div style="background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 4px; padding: 12px; margin-top: 15px;">
+                    <div style="font-weight: bold;">📊 理论库存计算</div>
+                    <div style="margin-top: 8px;">
+                        基准库存: ${baseStock} + 成功变化量: ${totalChange >= 0 ? '+' : ''}${totalChange} 
+                        = <strong style="color: #52c41a; font-size: 16px;">${theoreticalStock}</strong>
+                    </div>
+                    <div style="font-size: 12px; color: #666; margin-top: 4px;">
+                        （注: 被过滤和去重的变化量不计入）
+                    </div>
+                </div>
+            `;
+        }
+    } else {
+        html += `
+            <div style="text-align: center; color: #999; padding: 20px;">
+                暂无增量同步记录
+            </div>
+        `;
+    }
+    
+    resultContainer.innerHTML = html;
+}
+
+// 导出追溯数据
+async function exportTraceData() {
+    if (!currentTraceBarcode) {
+        alert('请先执行查询');
+        return;
+    }
+    
+    try {
+        const result = await ipcRenderer.invoke('dual-sync-export-trace', {
+            groupId: currentTraceGroupId,
+            barcode: currentTraceBarcode
+        });
+        
+        if (result.success) {
+            alert(`导出成功: ${result.filePath}`);
+            // 打开文件所在目录
+            ipcRenderer.invoke('open-file', result.filePath);
+        } else {
+            alert(`导出失败: ${result.error}`);
+        }
+    } catch (error) {
+        alert(`导出失败: ${error.message}`);
+    }
+}
+
+// 查看追溯详情（JSON日志）
+async function viewTraceDetail(syncRunId) {
+    try {
+        const dialog = document.getElementById('traceDetailDialog');
+        const titleEl = document.getElementById('traceDetailTitle');
+        const contentEl = document.getElementById('traceDetailContent').querySelector('pre');
+        
+        titleEl.textContent = `📄 同步详细记录 (运行ID: ${syncRunId})`;
+        contentEl.textContent = '加载中...';
+        dialog.showModal();
+        
+        const result = await ipcRenderer.invoke('dual-sync-get-trace-detail', {
+            groupId: currentTraceGroupId,
+            syncRunId: syncRunId
+        });
+        
+        if (result.success) {
+            currentTraceDetailData = JSON.stringify(result.data, null, 2);
+            contentEl.textContent = currentTraceDetailData;
+        } else {
+            contentEl.textContent = `加载失败: ${result.error}`;
+            currentTraceDetailData = null;
+        }
+    } catch (error) {
+        document.getElementById('traceDetailContent').querySelector('pre').textContent = `加载失败: ${error.message}`;
+        currentTraceDetailData = null;
+    }
+}
+
+// 关闭追溯详情对话框
+function closeTraceDetailDialog() {
+    const dialog = document.getElementById('traceDetailDialog');
+    dialog.close();
+    currentTraceDetailData = null;
+}
+
+// 复制追溯详情
+async function copyTraceDetail() {
+    if (!currentTraceDetailData) {
+        alert('没有可复制的内容');
+        return;
+    }
+    
+    try {
+        await navigator.clipboard.writeText(currentTraceDetailData);
+        alert('已复制到剪贴板');
+    } catch (error) {
+        // 降级方案
+        const textarea = document.createElement('textarea');
+        textarea.value = currentTraceDetailData;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+        alert('已复制到剪贴板');
+    }
+}

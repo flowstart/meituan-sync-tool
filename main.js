@@ -16,6 +16,27 @@ let syncManager = null;
 let dualSyncManager = null;
 
 /**
+ * 清理30天前的追溯数据
+ */
+function cleanupOldTraceData() {
+    try {
+        const DAYS_TO_KEEP = 30;
+        
+        // 清理数据库中的追溯记录
+        const dbDeleted = db.cleanupOldDualSyncTrace(DAYS_TO_KEEP);
+        logger.info(`清理数据库追溯记录: 删除 ${dbDeleted} 条`);
+        
+        // 清理JSON日志文件
+        const { cleanupOldTraceLogs } = require('./utils/trace-logger');
+        const dataDir = path.join(app.getPath('userData'), 'data');
+        const logResult = cleanupOldTraceLogs(dataDir, DAYS_TO_KEEP);
+        logger.info(`清理追溯日志文件: 删除 ${logResult.deletedFiles} 个文件, ${logResult.deletedDirs} 个目录`);
+    } catch (error) {
+        logger.error('清理追溯数据失败:', error);
+    }
+}
+
+/**
  * 创建主窗口
  */
 function createWindow() {
@@ -66,9 +87,13 @@ function initializeServices() {
         syncManager = new SyncManager(db);
         logger.info('同步管理器初始化完成');
 
-        // 初始化双向同步管理器
-        dualSyncManager = new DualSyncManager(db);
-        logger.info('双向同步管理器初始化完成');
+        // 初始化双向同步管理器（传入用户数据目录，避免打包后不可写）
+        const dataDir = path.join(app.getPath('userData'), 'data');
+        dualSyncManager = new DualSyncManager(db, dataDir);
+        logger.info(`双向同步管理器初始化完成，dataDir: ${dataDir}`);
+
+        // 启动时清理30天前的追溯数据
+        cleanupOldTraceData();
 
         // 监听日志事件，转发到渲染进程
         syncManager.on('log', (logEntry) => {
@@ -700,9 +725,8 @@ ipcMain.handle('dual-sync-duplicate-group', async (event, { groupId, newName }) 
 ipcMain.handle('dual-sync-full', async (event, { groupId, options = {} }) => {
     try {
         logger.info(`开始双向全量同步: 组${groupId}`);
-        // 确保传入用户数据目录下的 data 子目录，避免打包后路径问题
-        const exportDir = path.join(app.getPath('userData'), 'data');
-        const result = await dualSyncManager.fullSync(groupId, { ...options, exportDir });
+        // dataDir 已在 DualSyncManager 初始化时注入，无需再传递
+        const result = await dualSyncManager.fullSync(groupId, options);
         logger.info(`双向全量同步完成: 组${groupId}, 结果: ${result.status}`);
         return result;
     } catch (error) {
@@ -715,9 +739,8 @@ ipcMain.handle('dual-sync-full', async (event, { groupId, options = {} }) => {
 ipcMain.handle('dual-sync-incremental', async (event, { groupId }) => {
     try {
         logger.info(`开始双向增量同步: 组${groupId}`);
-        // 传入用户数据目录下的 data 子目录，避免打包后路径问题
-        const exportDir = path.join(app.getPath('userData'), 'data');
-        const result = await dualSyncManager.incrementalSync(groupId, { exportDir });
+        // dataDir 已在 DualSyncManager 初始化时注入，无需再传递
+        const result = await dualSyncManager.incrementalSync(groupId);
         logger.info(`双向增量同步完成: 组${groupId}, 结果: ${result.status}`);
         return result;
     } catch (error) {
@@ -744,9 +767,8 @@ ipcMain.handle('dual-sync-cancel', async (event, { groupId }) => {
 // 启动定时任务
 ipcMain.handle('dual-sync-start-scheduled', (event, { groupId, intervalMinutes = 10, runImmediately = true }) => {
     try {
-        // 传入用户数据目录下的 data 子目录，避免打包后路径问题
-        const exportDir = path.join(app.getPath('userData'), 'data');
-        dualSyncManager.startScheduledSync(groupId, intervalMinutes, { runImmediately, exportDir });
+        // dataDir 已在 DualSyncManager 初始化时注入，无需再传递
+        dualSyncManager.startScheduledSync(groupId, intervalMinutes, { runImmediately });
         logger.info(`双向同步定时任务启动: 组${groupId}, 间隔${intervalMinutes}分钟`);
         return { success: true };
     } catch (error) {
@@ -763,6 +785,18 @@ ipcMain.handle('dual-sync-stop-scheduled', (event, { groupId }) => {
         return { success: true };
     } catch (error) {
         logger.error(`停止双向同步定时任务失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 安全停止定时任务（查询阶段会 cancel 本轮；写入阶段默认仅停止后续定时）
+ipcMain.handle('dual-sync-stop-scheduled-safe', (event, { groupId }) => {
+    try {
+        const result = dualSyncManager.stopScheduledSyncSafe(groupId);
+        logger.info(`双向同步定时任务安全停止: 组${groupId}, action=${result.action || 'unknown'}`);
+        return result;
+    } catch (error) {
+        logger.error(`安全停止双向同步定时任务失败 (组${groupId}):`, error);
         return { success: false, error: error.message };
     }
 });
@@ -950,6 +984,138 @@ ipcMain.handle('dual-sync-select-b-qnh-store', async (event, { groupId, storeId,
         return { success: true };
     } catch (error) {
         logger.error(`选择B牵牛花门店失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// ==================== 追溯查询功能 ====================
+
+// 按条形码查询追溯记录
+ipcMain.handle('dual-sync-get-trace-by-barcode', async (event, { groupId, barcode, limit = 500 }) => {
+    try {
+        const result = db.getDualSyncTraceByBarcode(groupId, barcode, limit);
+        return { success: true, data: result };
+    } catch (error) {
+        logger.error(`查询追溯记录失败 (组${groupId}, 条形码${barcode}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 按同步批次查询追溯记录
+ipcMain.handle('dual-sync-get-trace-by-run', async (event, { groupId, syncRunId }) => {
+    try {
+        const records = db.getDualSyncTraceByRun(groupId, syncRunId);
+        return { success: true, data: records };
+    } catch (error) {
+        logger.error(`查询追溯记录失败 (组${groupId}, 运行ID${syncRunId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 获取追溯详细日志（JSON文件）
+ipcMain.handle('dual-sync-get-trace-detail', async (event, { groupId, syncRunId }) => {
+    try {
+        const { readTraceLog } = require('./utils/trace-logger');
+        const dataDir = path.join(app.getPath('userData'), 'data');
+        const logData = readTraceLog(dataDir, groupId, syncRunId);
+        
+        if (logData) {
+            return { success: true, data: logData };
+        } else {
+            return { success: false, error: '未找到详细日志' };
+        }
+    } catch (error) {
+        logger.error(`获取追溯详细日志失败 (组${groupId}, 运行ID${syncRunId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 列出追溯日志文件
+ipcMain.handle('dual-sync-list-trace-logs', async (event, { groupId, limit = 100 }) => {
+    try {
+        const { listTraceLogs } = require('./utils/trace-logger');
+        const dataDir = path.join(app.getPath('userData'), 'data');
+        const logs = listTraceLogs(dataDir, groupId, limit);
+        return { success: true, data: logs };
+    } catch (error) {
+        logger.error(`列出追溯日志失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 导出追溯数据到 Excel
+ipcMain.handle('dual-sync-export-trace', async (event, { groupId, barcode }) => {
+    try {
+        const XLSX = require('xlsx');
+        const result = db.getDualSyncTraceByBarcode(groupId, barcode, 1000);
+        
+        // 准备 Excel 数据
+        const excelData = [];
+        
+        // 添加全量同步基准
+        if (result.fullSyncBaseline) {
+            const baseline = result.fullSyncBaseline;
+            excelData.push({
+                '同步类型': '全量同步',
+                '方向': baseline.direction || 'A->B',
+                '时间': baseline.created_at,
+                '原始变化量': '-',
+                '过滤状态': '-',
+                '去重状态': '-',
+                '结果': baseline.apply_result,
+                '应用前库存': baseline.current_stock,
+                '目标库存': baseline.target_stock,
+                '错误信息': baseline.error_msg || ''
+            });
+        }
+        
+        // 添加增量同步记录
+        for (const record of result.incrementalRecords) {
+            excelData.push({
+                '同步类型': '增量同步',
+                '方向': record.direction,
+                '时间': record.created_at,
+                '原始变化量': record.source_total_change,
+                '过滤状态': record.was_filtered ? '是' : '否',
+                '去重状态': record.was_deduplicated ? '是' : '否',
+                '结果': record.apply_result,
+                '应用前库存': record.current_stock,
+                '目标库存': record.target_stock,
+                '错误信息': record.error_msg || ''
+            });
+        }
+        
+        // 创建工作簿
+        const wb = XLSX.utils.book_new();
+        const ws = XLSX.utils.json_to_sheet(excelData);
+        XLSX.utils.book_append_sheet(wb, ws, '追溯记录');
+        
+        // 保存文件
+        const dataDir = path.join(app.getPath('userData'), 'data', 'trace_export');
+        const fs = require('fs');
+        if (!fs.existsSync(dataDir)) {
+            fs.mkdirSync(dataDir, { recursive: true });
+        }
+        
+        const fileName = `trace_${groupId}_${barcode}_${Date.now()}.xlsx`;
+        const filePath = path.join(dataDir, fileName);
+        XLSX.writeFile(wb, filePath);
+        
+        logger.info(`导出追溯数据: ${filePath}`);
+        return { success: true, filePath };
+    } catch (error) {
+        logger.error(`导出追溯数据失败 (组${groupId}, 条形码${barcode}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// 获取最近一次全量同步时间
+ipcMain.handle('dual-sync-get-last-full-sync-time', async (event, { groupId }) => {
+    try {
+        const time = db.getLastFullSyncTime(groupId);
+        return { success: true, time };
+    } catch (error) {
+        logger.error(`获取全量同步时间失败 (组${groupId}):`, error);
         return { success: false, error: error.message };
     }
 });

@@ -448,6 +448,53 @@
         </div>
     </dialog>
 
+    <!-- 追溯查询对话框 -->
+    <dialog id="traceQueryDialog" class="dialog dialog-large">
+        <div class="dialog-header">
+            <h3>🔍 库存追溯查询</h3>
+            <button class="dialog-close" onclick="closeTraceQueryDialog()">✕</button>
+        </div>
+        <div class="dialog-content">
+            <!-- 查询区域 -->
+            <div class="form-group">
+                <label>按条形码查询同步历史：</label>
+                <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                    <input type="text" id="traceBarcodeInput" placeholder="输入商品条形码" style="flex: 1;">
+                    <button class="btn btn-primary" onclick="executeTraceQuery()">🔍 查询</button>
+                    <button class="btn btn-secondary" onclick="exportTraceData()">📥 导出</button>
+                </div>
+            </div>
+
+            <!-- 查询结果区域 -->
+            <div id="traceQueryResult" style="max-height: 500px; overflow-y: auto;">
+                <div style="text-align: center; color: #999; padding: 40px;">
+                    <p>请输入条形码查询商品的同步历史</p>
+                    <p style="font-size: 12px; margin-top: 8px;">将自动从最近一次全量同步开始追溯</p>
+                </div>
+            </div>
+        </div>
+        <div class="dialog-footer">
+            <button class="btn btn-primary" onclick="closeTraceQueryDialog()">关闭</button>
+        </div>
+    </dialog>
+
+    <!-- 追溯详情对话框（查看JSON日志） -->
+    <dialog id="traceDetailDialog" class="dialog dialog-large">
+        <div class="dialog-header">
+            <h3 id="traceDetailTitle">📄 同步详细记录</h3>
+            <button class="dialog-close" onclick="closeTraceDetailDialog()">✕</button>
+        </div>
+        <div class="dialog-content">
+            <div id="traceDetailContent" style="max-height: 500px; overflow: auto; background: #1e1e1e; padding: 15px; border-radius: 4px; font-family: monospace; font-size: 12px; color: #d4d4d4;">
+                <pre style="margin: 0; white-space: pre-wrap;"></pre>
+            </div>
+        </div>
+        <div class="dialog-footer">
+            <button class="btn btn-secondary" onclick="copyTraceDetail()">📋 复制</button>
+            <button class="btn btn-primary" onclick="closeTraceDetailDialog()">关闭</button>
+        </div>
+    </dialog>
+
     <script src="renderer.js"></script>
 </body>
 </html>

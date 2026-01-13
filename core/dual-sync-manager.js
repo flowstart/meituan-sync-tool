@@ -13,11 +13,14 @@ class DualSyncManager extends EventEmitter {
     /**
      * 初始化双向同步管理器
      * @param {Object} database - 数据库实例
+     * @param {string} dataDir - 用户数据目录（用于存储日志、追溯记录等运行时数据）
      */
-    constructor(database) {
+    constructor(database, dataDir = null) {
         super();
         
         this.db = database;
+        // 注入的数据目录，避免使用 __dirname（打包后不可写）
+        this.dataDir = dataDir || path.join(__dirname, '..', 'data');
         
         // 活跃的同步引擎实例 {groupId: DualSyncEngine}
         this._engines = new Map();
@@ -31,7 +34,7 @@ class DualSyncManager extends EventEmitter {
         // 组日志缓存 {groupId: [logEntry]}（最近100条）
         this._groupLogs = new Map();
         
-        console.log('[DualSyncManager] 初始化完成');
+        console.log(`[DualSyncManager] 初始化完成，dataDir: ${this.dataDir}`);
     }
 
     /**
@@ -78,14 +81,15 @@ class DualSyncManager extends EventEmitter {
             }
         };
 
-        // 创建引擎
+        // 创建引擎（传入 dataDir，避免引擎使用硬编码路径）
         const engine = new DualSyncEngine(
             config,
             this.db,
             groupId,
             this._emitLog.bind(this),
             this._emitProgress.bind(this),
-            debugMode
+            debugMode,
+            this.dataDir
         );
 
         this._engines.set(groupId, engine);
@@ -147,9 +151,9 @@ class DualSyncManager extends EventEmitter {
             logs.shift();
         }
 
-        // 2. 写入文件
+        // 2. 写入文件（使用注入的 dataDir，避免打包后不可写）
         try {
-            const logDir = path.join('logs', 'dual-sync');
+            const logDir = path.join(this.dataDir, 'logs', 'dual-sync');
             if (!fs.existsSync(logDir)) {
                 fs.mkdirSync(logDir, { recursive: true });
             }
@@ -190,7 +194,8 @@ class DualSyncManager extends EventEmitter {
             this._running.set(groupId, { type: 'full' });
             this.emit('sync-started', { groupId, type: 'full' });
             
-            const result = await engine.fullSync(options.exportDir);
+            // 不再传递 exportDir，引擎使用构造时注入的 dataDir
+            const result = await engine.fullSync();
             
             if (result.status === 'success') {
                 this._emitLog(groupId, 'info', '全量同步成功');
@@ -222,7 +227,8 @@ class DualSyncManager extends EventEmitter {
             this._running.set(groupId, { type: 'incremental' });
             this.emit('sync-started', { groupId, type: 'incremental' });
             
-            const result = await engine.incrementalSync(options.exportDir);
+            // 不再传递 exportDir，引擎使用构造时注入的 dataDir
+            const result = await engine.incrementalSync();
             
             if (result.status === 'success') {
                 this._emitLog(groupId, 'info', '增量同步成功');
@@ -307,7 +313,7 @@ class DualSyncManager extends EventEmitter {
 
         const intervalMs = intervalMinutes * 60 * 1000;
         const runImmediately = options.runImmediately !== undefined ? !!options.runImmediately : true;
-        const exportDir = options.exportDir; // 保存导出目录
+        // 不再需要 exportDir，引擎使用构造时注入的 dataDir
 
         this._emitLog(groupId, 'info', `启动定时任务，间隔: ${intervalMinutes}分钟${runImmediately ? '（立即执行一次）' : ''}`);
 
@@ -324,21 +330,43 @@ class DualSyncManager extends EventEmitter {
             return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
         };
 
+        const scheduleNext = (delayMs) => {
+            if (!this._scheduledTasks.has(groupId)) return;
+            const task = this._scheduledTasks.get(groupId);
+
+            // 清理旧定时器（兼容历史 setInterval / setTimeout）
+            try { clearTimeout(task.timerId); } catch (_) {}
+            try { clearInterval(task.timerId); } catch (_) {}
+
+            const nextDueAt = new Date(Date.now() + delayMs);
+            task.nextDueAt = nextDueAt;
+            task.timerType = 'timeout';
+            task.timerId = setTimeout(() => runOnce(), delayMs);
+
+            this._emitLog(groupId, 'info', `下次定时同步时间: ${toBeijing(nextDueAt)}`);
+        };
+
         const runOnce = async () => {
+            // fixed-delay：以上一次“任务完成时间”为基准，完成后再延迟 intervalMs 执行下一次
             if (this.isRunning(groupId)) {
                 this._emitLog(groupId, 'warn', '上一次任务仍在进行，跳过本轮');
+                // 本轮跳过也按 fixed-delay 继续排下一次
+                if (this._scheduledTasks.has(groupId)) scheduleNext(intervalMs);
                 return;
             }
 
             this._emitLog(groupId, 'info', `定时增量同步开始 (间隔: ${intervalMinutes}分钟)`);
             
             try {
-                const result = await this.incrementalSync(groupId, { exportDir });
+                // 不再传递 exportDir，使用引擎内部的 dataDir
+                const result = await this.incrementalSync(groupId);
                 
                 if (result.status === 'success') {
                     this._emitLog(groupId, 'info', '定时增量同步完成');
                 } else if (result.status === 'partial') {
                     this._emitLog(groupId, 'warn', `定时增量同步部分完成: 成功${result.success}个, 失败${result.failed}个`);
+                } else if (result.status === 'cancelled') {
+                    this._emitLog(groupId, 'warn', '定时增量同步已取消');
                 } else if (result.error === 'require_full_sync_first' || 
                            result.error === 'require_full_sync_due_to_time_range') {
                     this._emitLog(groupId, 'warn', '需要先执行全量同步，已停止定时任务');
@@ -374,27 +402,28 @@ class DualSyncManager extends EventEmitter {
                     return;
                 }
             } finally {
-                // 记录下次执行时间（只有任务未被停止时才显示）
+                // fixed-delay：任务结束后再安排下一次
                 if (this._scheduledTasks.has(groupId)) {
-                    const next = new Date(Date.now() + intervalMs);
-                    this._emitLog(groupId, 'info', `下次定时同步时间: ${toBeijing(next)}`);
+                    scheduleNext(intervalMs);
                 }
             }
         };
 
-        // 设置定时器
-        const timerId = setInterval(runOnce, intervalMs);
+        // 写入任务状态（先占位，便于 scheduleNext / stop 能正确工作）
+        this._scheduledTasks.set(groupId, {
+            timerId: null,
+            timerType: 'timeout',
+            intervalMinutes: intervalMinutes,
+            runImmediately: runImmediately,
+            startTime: new Date(),
+            nextDueAt: null
+        });
 
         if (runImmediately) {
             runOnce();
+        } else {
+            scheduleNext(intervalMs);
         }
-
-        this._scheduledTasks.set(groupId, {
-            timerId: timerId,
-            intervalMinutes: intervalMinutes,
-            runImmediately: runImmediately,
-            startTime: new Date()
-        });
 
         // 触发状态变化事件
         this.emit('scheduled-task-changed', {
@@ -412,7 +441,9 @@ class DualSyncManager extends EventEmitter {
     stopScheduledSync(groupId) {
         if (this._scheduledTasks.has(groupId)) {
             const task = this._scheduledTasks.get(groupId);
-            clearInterval(task.timerId);
+            // 兼容清理 setInterval / setTimeout
+            try { clearInterval(task.timerId); } catch (_) {}
+            try { clearTimeout(task.timerId); } catch (_) {}
             this._scheduledTasks.delete(groupId);
 
             this._emitLog(groupId, 'info', '定时任务已停止');
@@ -425,6 +456,45 @@ class DualSyncManager extends EventEmitter {
 
             console.log(`[DualSyncManager] 组 ${groupId} 定时任务已停止`);
         }
+    }
+
+    /**
+     * 安全停止定时任务：
+     * - 永远停止后续定时触发
+     * - 若当前正在运行且仍在查询阶段，则同时 cancel 本轮
+     * - 若已进入写入阶段，则默认不取消本轮（避免写入中断导致状态不一致）
+     */
+    stopScheduledSyncSafe(groupId) {
+        const wasScheduled = this._scheduledTasks.has(groupId);
+        if (wasScheduled) {
+            this.stopScheduledSync(groupId);
+        }
+
+        if (this.isRunning(groupId)) {
+            const engine = this._engines.get(groupId);
+            const stage = engine && typeof engine.getStage === 'function'
+                ? engine.getStage()
+                : (engine && engine.stage ? engine.stage : 'idle');
+
+            if (stage === 'querying') {
+                try {
+                    engine && engine.cancel();
+                    this._emitLog(groupId, 'warn', '已停止定时任务，并在查询阶段取消本轮同步（安全取消）');
+                    return { success: true, action: 'stop_scheduled_and_cancel_running' };
+                } catch (e) {
+                    this._emitLog(groupId, 'error', `安全取消失败: ${e.message}`);
+                    return { success: false, error: e.message };
+                }
+            }
+
+            this._emitLog(groupId, 'warn', '已停止定时任务；当前已进入写入阶段，本轮将继续完成（未取消本轮）');
+            return { success: true, action: 'stop_scheduled_only_running_apply' };
+        }
+
+        if (wasScheduled) {
+            return { success: true, action: 'stop_scheduled' };
+        }
+        return { success: false, error: 'no_active_task' };
     }
 
     /**
@@ -449,6 +519,7 @@ class DualSyncManager extends EventEmitter {
                     groupId: groupId,
                     intervalMinutes: task.intervalMinutes,
                     startTime: task.startTime,
+                    nextDueAt: task.nextDueAt || null,
                     isActive: true
                 };
             }
@@ -462,6 +533,7 @@ class DualSyncManager extends EventEmitter {
                 groupId: gid,
                 intervalMinutes: task.intervalMinutes,
                 startTime: task.startTime,
+                nextDueAt: task.nextDueAt || null,
                 isActive: true
             });
         }

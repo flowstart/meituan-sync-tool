@@ -233,6 +233,49 @@ class SyncDatabase {
             )
         `);
 
+        // 8.2 双向同步：断点续跑（增量写入 pending 列表）
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_pending_change (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sync_run_id INTEGER NOT NULL,
+                direction_code TEXT NOT NULL, -- 'A->B' / 'B->A'
+                dest_side TEXT NOT NULL,      -- 'A' / 'B'
+                barcode TEXT NOT NULL,
+                delta INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', -- pending/applied/failed
+                error_msg TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(group_id, sync_run_id, direction_code, barcode),
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
+        // 8.3 双向同步：追溯记录表（用于排查库存不一致问题）
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_trace (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sync_run_id INTEGER NOT NULL,
+                sync_type TEXT NOT NULL,
+                direction TEXT,
+                barcode TEXT NOT NULL,
+                product_name TEXT,
+                source_records_count INTEGER,
+                source_total_change INTEGER,
+                was_filtered INTEGER DEFAULT 0,
+                was_deduplicated INTEGER DEFAULT 0,
+                filter_reason TEXT,
+                current_stock INTEGER,
+                target_stock INTEGER,
+                apply_result TEXT,
+                error_msg TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
         // 9. 数据库迁移：添加缺失的列（向后兼容）
         this._migrateDatabase();
 
@@ -252,6 +295,11 @@ class SyncDatabase {
             CREATE INDEX IF NOT EXISTS idx_dual_sync_stock_barcode ON dual_sync_stock_snapshot(barcode);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_applied_change_group_side_time ON dual_sync_applied_change(group_id, dest_side, applied_at);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_applied_change_fingerprint ON dual_sync_applied_change(group_id, dest_side, barcode, old_stock, new_stock);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_pending_group_run_status ON dual_sync_pending_change(group_id, sync_run_id, status);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_pending_group_status ON dual_sync_pending_change(group_id, status);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_trace_barcode ON dual_sync_trace(group_id, barcode, created_at);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_trace_run ON dual_sync_trace(group_id, sync_run_id);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_trace_type ON dual_sync_trace(group_id, sync_type, created_at);
         `);
     }
 
@@ -318,6 +366,27 @@ class SyncDatabase {
                     }
                 } else {
                     console.log(`[Database] ⏭️  列已存在(dual): ${column.name}`);
+                }
+            }
+
+            // dual_sync_history 增量断点：记录本轮查询窗口（便于取消后恢复并最终推进 query_time）
+            const dualHistoryInfo = this.db.prepare("PRAGMA table_info(dual_sync_history)").all();
+            const dualHistoryCols = new Set(dualHistoryInfo.map(col => col.name));
+            const dualHistoryColumnsToAdd = [
+                { name: 'a_query_start_time', type: 'TEXT' },
+                { name: 'a_query_end_time', type: 'TEXT' },
+                { name: 'b_query_start_time', type: 'TEXT' },
+                { name: 'b_query_end_time', type: 'TEXT' }
+            ];
+            for (const column of dualHistoryColumnsToAdd) {
+                if (!dualHistoryCols.has(column.name)) {
+                    try {
+                        const sql = `ALTER TABLE dual_sync_history ADD COLUMN ${column.name} ${column.type}`;
+                        this.db.exec(sql);
+                        console.log(`[Database] ✅ 添加列(dual_history): ${column.name}`);
+                    } catch (error) {
+                        console.error(`[Database] ❌ 添加列失败(dual_history) (${column.name}):`, error.message);
+                    }
                 }
             }
             
@@ -1126,7 +1195,11 @@ class SyncDatabase {
             totalItems: 'total_items',
             successItems: 'success_items',
             failedItems: 'failed_items',
-            errorMsg: 'error_msg'
+            errorMsg: 'error_msg',
+            aQueryStartTime: 'a_query_start_time',
+            aQueryEndTime: 'a_query_end_time',
+            bQueryStartTime: 'b_query_start_time',
+            bQueryEndTime: 'b_query_end_time'
         };
         
         for (const [key, dbField] of Object.entries(fieldMap)) {
@@ -1149,6 +1222,121 @@ class SyncDatabase {
         const sql = `UPDATE dual_sync_history SET ${fields.join(', ')} WHERE id = ?`;
         const stmt = this.db.prepare(sql);
         stmt.run(...values);
+    }
+
+    // ==================== 双向同步：断点续跑 pending 列表 ====================
+
+    /**
+     * 批量写入 pending 变更（断点续跑）
+     * @param {number} groupId
+     * @param {number} syncRunId - dual_sync_history.id
+     * @param {string} directionCode - 'A->B' / 'B->A'
+     * @param {string} destSide - 'A' / 'B'
+     * @param {Array<{barcode: string, delta: number}>} items
+     */
+    addDualSyncPendingChanges(groupId, syncRunId, directionCode, destSide, items) {
+        if (!items || items.length === 0) return;
+        const now = toLocalISOString();
+
+        const stmt = this.db.prepare(`
+            INSERT OR IGNORE INTO dual_sync_pending_change (
+                group_id, sync_run_id, direction_code, dest_side,
+                barcode, delta, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        `);
+
+        const transaction = this.db.transaction((rows) => {
+            for (const row of rows) {
+                stmt.run(
+                    groupId,
+                    syncRunId,
+                    directionCode,
+                    destSide,
+                    row.barcode,
+                    row.delta,
+                    now,
+                    now
+                );
+            }
+        });
+        transaction(items);
+    }
+
+    /**
+     * 获取某个 run 的 pending 变更
+     */
+    getDualSyncPendingChanges(groupId, syncRunId, directionCode = null, status = 'pending') {
+        let sql = `
+            SELECT direction_code, dest_side, barcode, delta, status
+            FROM dual_sync_pending_change
+            WHERE group_id = ? AND sync_run_id = ? AND status = ?
+        `;
+        const params = [groupId, syncRunId, status];
+        if (directionCode) {
+            sql += ` AND direction_code = ?`;
+            params.push(directionCode);
+        }
+        sql += ` ORDER BY id ASC`;
+        return this.db.prepare(sql).all(...params);
+    }
+
+    /**
+     * 获取最近一个仍有 pending 的 run（用于恢复）
+     */
+    getLatestDualSyncPendingRunId(groupId) {
+        const row = this.db.prepare(`
+            SELECT sync_run_id, COUNT(1) AS c
+            FROM dual_sync_pending_change
+            WHERE group_id = ? AND status = 'pending'
+            GROUP BY sync_run_id
+            ORDER BY sync_run_id DESC
+            LIMIT 1
+        `).get(groupId);
+        return row ? row.sync_run_id : null;
+    }
+
+    /**
+     * 将一批条形码标记为 applied
+     */
+    markDualSyncPendingApplied(groupId, syncRunId, directionCode, barcodes) {
+        if (!barcodes || barcodes.length === 0) return;
+        const now = toLocalISOString();
+        const placeholders = barcodes.map(() => '?').join(',');
+        const sql = `
+            UPDATE dual_sync_pending_change
+            SET status = 'applied', updated_at = ?, error_msg = NULL
+            WHERE group_id = ? AND sync_run_id = ? AND direction_code = ?
+              AND status = 'pending'
+              AND barcode IN (${placeholders})
+        `;
+        this.db.prepare(sql).run(now, groupId, syncRunId, directionCode, ...barcodes);
+    }
+
+    /**
+     * 将条形码标记为 failed（不会再重试，避免一直卡在 pending）
+     */
+    markDualSyncPendingFailed(groupId, syncRunId, directionCode, barcodes, errorMsg = 'failed') {
+        if (!barcodes || barcodes.length === 0) return;
+        const now = toLocalISOString();
+        const placeholders = barcodes.map(() => '?').join(',');
+        const sql = `
+            UPDATE dual_sync_pending_change
+            SET status = 'failed', updated_at = ?, error_msg = ?
+            WHERE group_id = ? AND sync_run_id = ? AND direction_code = ?
+              AND status = 'pending'
+              AND barcode IN (${placeholders})
+        `;
+        this.db.prepare(sql).run(now, errorMsg, groupId, syncRunId, directionCode, ...barcodes);
+    }
+
+    /**
+     * 清理某个 run 的 pending 表（全部 applied 后）
+     */
+    clearDualSyncPendingRun(groupId, syncRunId) {
+        this.db.prepare(`
+            DELETE FROM dual_sync_pending_change
+            WHERE group_id = ? AND sync_run_id = ?
+        `).run(groupId, syncRunId);
     }
 
     // ==================== 双向同步：工具写入指纹（用于过滤饿了么回流） ====================
@@ -1249,6 +1437,20 @@ class SyncDatabase {
             LIMIT ?
         `);
         return stmt.all(groupId, limit);
+    }
+
+    /**
+     * 获取双向同步历史记录（按ID）
+     * @param {number} recordId
+     * @returns {Object|null}
+     */
+    getDualSyncHistoryById(recordId) {
+        const stmt = this.db.prepare(`
+            SELECT * FROM dual_sync_history
+            WHERE id = ?
+            LIMIT 1
+        `);
+        return stmt.get(recordId) || null;
     }
 
     // ==================== 双向同步库存快照 ====================
@@ -1359,6 +1561,169 @@ class SyncDatabase {
         const stmt = this.db.prepare('DELETE FROM dual_sync_stock_snapshot WHERE group_id = ?');
         stmt.run(groupId);
         console.log(`[Database] 清空双向同步组 ${groupId} 的库存快照`);
+    }
+
+    // ==================== 双向同步追溯记录 ====================
+
+    /**
+     * 批量写入追溯记录
+     * @param {number} groupId - 双向同步组ID
+     * @param {number} syncRunId - 同步运行ID (dual_sync_history.id)
+     * @param {string} syncType - 同步类型 'full' / 'incremental'
+     * @param {Array<Object>} traces - 追溯记录列表
+     */
+    addDualSyncTraceBatch(groupId, syncRunId, syncType, traces) {
+        if (!traces || traces.length === 0) return;
+
+        const now = toLocalISOString();
+        const stmt = this.db.prepare(`
+            INSERT INTO dual_sync_trace (
+                group_id, sync_run_id, sync_type, direction, barcode, product_name,
+                source_records_count, source_total_change,
+                was_filtered, was_deduplicated, filter_reason,
+                current_stock, target_stock, apply_result, error_msg,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const transaction = this.db.transaction((rows) => {
+            for (const row of rows) {
+                stmt.run(
+                    groupId,
+                    syncRunId,
+                    syncType,
+                    row.direction || null,
+                    row.barcode,
+                    row.productName || null,
+                    row.sourceRecordsCount ?? null,
+                    row.sourceTotalChange ?? null,
+                    row.wasFiltered ? 1 : 0,
+                    row.wasDeduplicated ? 1 : 0,
+                    row.filterReason || null,
+                    row.currentStock ?? null,
+                    row.targetStock ?? null,
+                    row.applyResult || null,
+                    row.errorMsg || null,
+                    now
+                );
+            }
+        });
+
+        transaction(traces);
+        console.log(`[Database] 批量写入追溯记录: ${traces.length} 条`);
+    }
+
+    /**
+     * 按条形码查询追溯记录（自动从最近全量同步开始）
+     * @param {number} groupId - 双向同步组ID
+     * @param {string} barcode - 条形码
+     * @param {number} limit - 最大返回数量
+     * @returns {Object} { fullSyncBaseline, incrementalRecords, isFullSyncOlderThan30Days }
+     */
+    getDualSyncTraceByBarcode(groupId, barcode, limit = 500) {
+        // 1. 查找该商品最近一次全量同步的基准记录
+        const fullSyncStmt = this.db.prepare(`
+            SELECT * FROM dual_sync_trace
+            WHERE group_id = ? AND barcode = ? AND sync_type = 'full'
+            ORDER BY created_at DESC
+            LIMIT 1
+        `);
+        const fullSyncBaseline = fullSyncStmt.get(groupId, barcode) || null;
+
+        // 2. 判断全量同步是否超过30天
+        let isFullSyncOlderThan30Days = false;
+        let sinceTime = null;
+        const thirtyDaysAgo = toLocalISOString(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
+
+        if (fullSyncBaseline) {
+            if (fullSyncBaseline.created_at < thirtyDaysAgo) {
+                isFullSyncOlderThan30Days = true;
+                sinceTime = thirtyDaysAgo;
+            } else {
+                sinceTime = fullSyncBaseline.created_at;
+            }
+        } else {
+            // 没有全量同步记录，从30天前开始查
+            isFullSyncOlderThan30Days = true;
+            sinceTime = thirtyDaysAgo;
+        }
+
+        // 3. 查询增量同步记录
+        const incrStmt = this.db.prepare(`
+            SELECT * FROM dual_sync_trace
+            WHERE group_id = ? AND barcode = ? AND sync_type = 'incremental'
+              AND created_at >= ?
+            ORDER BY created_at ASC
+            LIMIT ?
+        `);
+        const incrementalRecords = incrStmt.all(groupId, barcode, sinceTime, limit);
+
+        return {
+            fullSyncBaseline,
+            incrementalRecords,
+            isFullSyncOlderThan30Days
+        };
+    }
+
+    /**
+     * 按同步批次查询追溯记录
+     * @param {number} groupId - 双向同步组ID
+     * @param {number} syncRunId - 同步运行ID
+     * @returns {Array<Object>} 追溯记录列表
+     */
+    getDualSyncTraceByRun(groupId, syncRunId) {
+        const stmt = this.db.prepare(`
+            SELECT * FROM dual_sync_trace
+            WHERE group_id = ? AND sync_run_id = ?
+            ORDER BY barcode, direction
+        `);
+        return stmt.all(groupId, syncRunId);
+    }
+
+    /**
+     * 获取该商品最近一次全量同步的基准库存
+     * @param {number} groupId - 双向同步组ID
+     * @param {string} barcode - 条形码
+     * @returns {Object|null} 基准记录
+     */
+    getLastFullSyncTraceForBarcode(groupId, barcode) {
+        const stmt = this.db.prepare(`
+            SELECT * FROM dual_sync_trace
+            WHERE group_id = ? AND barcode = ? AND sync_type = 'full'
+            ORDER BY created_at DESC
+            LIMIT 1
+        `);
+        return stmt.get(groupId, barcode) || null;
+    }
+
+    /**
+     * 清理指定天数前的追溯记录
+     * @param {number} daysToKeep - 保留天数
+     * @returns {number} 删除的记录数
+     */
+    cleanupOldDualSyncTrace(daysToKeep = 30) {
+        const cutoff = toLocalISOString(new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000));
+        const stmt = this.db.prepare(`
+            DELETE FROM dual_sync_trace
+            WHERE created_at < ?
+        `);
+        const result = stmt.run(cutoff);
+        console.log(`[Database] 清理 ${daysToKeep} 天前的追溯记录: ${result.changes} 条`);
+        return result.changes;
+    }
+
+    /**
+     * 获取双向同步组的最近一次全量同步时间
+     * @param {number} groupId - 双向同步组ID
+     * @returns {string|null} 全量同步时间
+     */
+    getLastFullSyncTime(groupId) {
+        const stmt = this.db.prepare(`
+            SELECT last_full_sync_time FROM dual_sync_groups
+            WHERE id = ?
+        `);
+        const row = stmt.get(groupId);
+        return row ? row.last_full_sync_time : null;
     }
 }
 
