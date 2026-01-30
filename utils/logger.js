@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const { toLocalISOString, toLocalDateString } = require('./time-utils');
+const fileWriteQueue = require('./file-write-queue');
 
 class Logger {
     constructor(options = {}) {
@@ -87,17 +88,26 @@ class Logger {
         try {
             const logFile = this._getLogFilePath();
 
-            // 检查文件大小，如果超过限制则备份
-            if (fs.existsSync(logFile)) {
-                const stats = fs.statSync(logFile);
-                if (stats.size > this.maxFileSize) {
-                    const backupFile = logFile.replace('.log', `-${Date.now()}.log`);
-                    fs.renameSync(logFile, backupFile);
+            // 串行化：rotate + append 都放到同一文件队列，避免并发写乱序
+            fileWriteQueue.enqueue(logFile, async () => {
+                // 检查文件大小，如果超过限制则备份
+                try {
+                    const stats = await fs.promises.stat(logFile);
+                    if (stats && stats.size > this.maxFileSize) {
+                        const backupFile = logFile.replace('.log', `-${Date.now()}.log`);
+                        try {
+                            await fs.promises.rename(logFile, backupFile);
+                        } catch (e) {
+                            // rename 失败不影响继续写入
+                            console.error('备份日志文件失败:', e && e.message ? e.message : e);
+                        }
+                    }
+                } catch (_) {
+                    // 文件不存在时忽略
                 }
-            }
 
-            // 追加日志
-            fs.appendFileSync(logFile, message + '\n', 'utf8');
+                await fileWriteQueue.appendFile(logFile, message + '\n', 'utf8');
+            });
         } catch (error) {
             console.error('写入日志文件失败:', error);
         }

@@ -8,6 +8,7 @@ const DualSyncEngine = require('./dual-sync-engine');
 const { toLocalISOString } = require('../utils/time-utils');
 const path = require('path');
 const fs = require('fs');
+const fileWriteQueue = require('../utils/file-write-queue');
 
 class DualSyncManager extends EventEmitter {
     /**
@@ -154,15 +155,11 @@ class DualSyncManager extends EventEmitter {
         // 2. 写入文件（使用注入的 dataDir，避免打包后不可写）
         try {
             const logDir = path.join(this.dataDir, 'logs', 'dual-sync');
-            if (!fs.existsSync(logDir)) {
-                fs.mkdirSync(logDir, { recursive: true });
-            }
-            
             const dateStr = this._getDateStr();
             const logFile = path.join(logDir, `dual_group_${groupId}_${dateStr}.log`);
             const logLine = `[${toLocalISOString(logEntry.timestamp)}] [${level.toUpperCase()}] ${message}\n`;
-            
-            fs.appendFileSync(logFile, logLine);
+            // 异步串行写入（避免阻塞事件循环）
+            fileWriteQueue.appendFile(logFile, logLine, 'utf8');
         } catch (error) {
             console.error(`[DualSyncManager] 写入日志文件失败: ${error.message}`);
         }

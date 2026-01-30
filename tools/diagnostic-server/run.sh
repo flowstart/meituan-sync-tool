@@ -1,0 +1,1 @@
+node  server.js --data-dir="/Users/jonelee/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidain_2026/Obsidian_2026/M-商单/0101-美团牵牛花库存同步-0118/project/elm2qnh/meituan-sync-tool"

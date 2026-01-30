@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>美团同步工具 - 诊断服务</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- 顶部工具栏 -->
+        <div class="toolbar">
+            <div class="toolbar-title">诊断服务</div>
+            <div class="toolbar-info">
+                <span id="dataDir">未加载数据</span>
+            </div>
+        </div>
+
+        <!-- 配置提示（未加载数据时显示） -->
+        <div id="configPrompt" class="config-prompt">
+            <div class="config-card">
+                <h2>配置数据目录</h2>
+                <p>请输入客户提供的 meituan-sync-tool 文件夹路径</p>
+                <div class="config-form">
+                    <input type="text" id="dataDirInput" placeholder="例如: /Users/xxx/meituan-sync-tool" />
+                    <button onclick="setDataDir()" class="btn btn-primary">加载数据</button>
+                </div>
+                <p class="hint">提示: 也可以通过命令行参数 --data-dir 指定</p>
+            </div>
+        </div>
+
+        <!-- 主内容区域 -->
+        <div id="mainContent" class="main-content" style="display: none;">
+            <!-- 左侧导航 -->
+            <div class="sidebar">
+                <div class="nav-item active" data-page="overview" onclick="switchPage('overview')">
+                    <span class="nav-icon">📊</span>
+                    <span>概览</span>
+                </div>
+                <div class="nav-item" data-page="history" onclick="switchPage('history')">
+                    <span class="nav-icon">📋</span>
+                    <span>同步历史</span>
+                </div>
+                <div class="nav-item" data-page="trace" onclick="switchPage('trace')">
+                    <span class="nav-icon">🔍</span>
+                    <span>追溯查询</span>
+                </div>
+                <div class="nav-item" data-page="snapshots" onclick="switchPage('snapshots')">
+                    <span class="nav-icon">📦</span>
+                    <span>库存快照</span>
+                </div>
+                <div class="nav-item" data-page="failures" onclick="switchPage('failures')">
+                    <span class="nav-icon">⚠️</span>
+                    <span>失败分析</span>
+                </div>
+                <div class="nav-item" data-page="records" onclick="switchPage('records')">
+                    <span class="nav-icon">📝</span>
+                    <span>操作记录</span>
+                </div>
+            </div>
+
+            <!-- 右侧内容 -->
+            <div class="content">
+                <!-- 概览页 -->
+                <div id="page-overview" class="page active">
+                    <h2>诊断概览</h2>
+                    <div id="overviewContent">
+                        <div class="loading">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- 同步历史页 -->
+                <div id="page-history" class="page">
+                    <h2>同步历史</h2>
+                    <div class="filter-bar">
+                        <select id="historyGroupFilter" onchange="loadHistory()">
+                            <option value="">全部组</option>
+                        </select>
+                        <button onclick="loadHistory()" class="btn">刷新</button>
+                    </div>
+                    <div id="historyContent">
+                        <div class="loading">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- 追溯查询页 -->
+                <div id="page-trace" class="page">
+                    <h2>追溯查询</h2>
+                    <div class="filter-bar">
+                        <select id="traceGroupFilter">
+                            <option value="">选择同步组</option>
+                        </select>
+                        <input type="text" id="traceBarcodeInput" placeholder="输入条形码" />
+                        <button onclick="searchTrace()" class="btn btn-primary">查询</button>
+                    </div>
+                    
+                    <!-- 门店父级 Tab -->
+                    <div id="traceSideTabs" class="trace-side-tabs" style="display: none;">
+                        <div class="trace-side-tab active" data-side="A" onclick="switchTraceSide('A')">
+                            <span class="side-icon">🏪</span>
+                            <span class="side-name">A 门店</span>
+                            <span class="side-store" id="sideAStoreName"></span>
+                        </div>
+                        <div class="trace-side-tab" data-side="B" onclick="switchTraceSide('B')">
+                            <span class="side-icon">🏬</span>
+                            <span class="side-name">B 门店</span>
+                            <span class="side-store" id="sideBStoreName"></span>
+                        </div>
+                    </div>
+                    
+                    <!-- 基准信息区域 -->
+                    <div id="traceBaseline" class="trace-baseline" style="display: none;">
+                        <div class="baseline-header">
+                            <span id="baselineTitle">全量同步基准</span>
+                        </div>
+                        <div class="baseline-content">
+                            <div class="baseline-item">
+                                <span class="baseline-label">商品名称</span>
+                                <span class="baseline-value" id="baselineProductName">-</span>
+                            </div>
+                            <div class="baseline-item">
+                                <span class="baseline-label">条形码</span>
+                                <span class="baseline-value" id="baselineBarcode">-</span>
+                            </div>
+                            <div class="baseline-item">
+                                <span class="baseline-label">基准库存</span>
+                                <span class="baseline-value" id="baselineStock">-</span>
+                            </div>
+                            <div class="baseline-item">
+                                <span class="baseline-label">全量同步时间</span>
+                                <span class="baseline-value" id="baselineTime">-</span>
+                            </div>
+                            <div class="baseline-item">
+                                <span class="baseline-label">当前理论库存</span>
+                                <span class="baseline-value highlight" id="theoreticalStock">-</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 状态子 Tab 切换 -->
+                    <div id="traceTabs" class="trace-tabs" style="display: none;">
+                        <div class="trace-tab active" data-tab="all" onclick="switchTraceTab('all')">
+                            全部 <span class="tab-count" id="tabCountAll">0</span>
+                        </div>
+                        <div class="trace-tab" data-tab="synced" onclick="switchTraceTab('synced')">
+                            已同步 <span class="tab-count" id="tabCountSynced">0</span>
+                        </div>
+                        <div class="trace-tab" data-tab="filtered" onclick="switchTraceTab('filtered')">
+                            已过滤 <span class="tab-count" id="tabCountFiltered">0</span>
+                        </div>
+                        <div class="trace-tab" data-tab="deduplicated" onclick="switchTraceTab('deduplicated')">
+                            已去重 <span class="tab-count" id="tabCountDeduplicated">0</span>
+                        </div>
+                        <div class="trace-tab" data-tab="failed" onclick="switchTraceTab('failed')">
+                            同步失败 <span class="tab-count" id="tabCountFailed">0</span>
+                        </div>
+                    </div>
+                    
+                    <div id="traceContent">
+                        <div class="hint-box">
+                            <p>请选择同步组并输入条形码进行查询</p>
+                            <p class="hint">将分别展示 A/B 两个门店的操作记录追溯</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 库存快照页 -->
+                <div id="page-snapshots" class="page">
+                    <h2>库存快照</h2>
+                    <div class="filter-bar">
+                        <select id="snapshotGroupFilter" onchange="loadSnapshots()">
+                            <option value="">选择同步组</option>
+                        </select>
+                        <input type="text" id="snapshotSearchInput" placeholder="搜索条形码或商品名" oninput="filterSnapshots()" />
+                    </div>
+                    <div id="snapshotContent">
+                        <div class="hint-box">
+                            <p>请选择同步组查看库存快照</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 失败分析页 -->
+                <div id="page-failures" class="page">
+                    <h2>失败分析</h2>
+                    <div class="filter-bar">
+                        <select id="failureGroupFilter" onchange="loadFailures()">
+                            <option value="">全部组</option>
+                        </select>
+                    </div>
+                    <div id="failureContent">
+                        <div class="loading">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- 操作记录查询页 -->
+                <div id="page-records" class="page">
+                    <h2>库存操作记录查询</h2>
+                    <div class="filter-bar records-filter">
+                        <div class="filter-row">
+                            <select id="recordsGroupFilter" onchange="onRecordsGroupChange()">
+                                <option value="">选择同步组</option>
+                            </select>
+                            <select id="recordsSideFilter">
+                                <option value="">全部门店</option>
+                                <option value="A">A 门店</option>
+                                <option value="B">B 门店</option>
+                            </select>
+                            <input type="text" id="recordsBarcodeInput" placeholder="条形码" style="width: 150px;" />
+                            <input type="number" id="recordsOldStockInput" placeholder="老库存" style="width: 80px;" />
+                            <input type="number" id="recordsNewStockInput" placeholder="新库存" style="width: 80px;" />
+                        </div>
+                        <div class="filter-row">
+                            <label>任务ID范围:</label>
+                            <input type="number" id="recordsSyncIdStart" placeholder="起始ID" style="width: 100px;" />
+                            <span>~</span>
+                            <input type="number" id="recordsSyncIdEnd" placeholder="结束ID" style="width: 100px;" />
+                            <select id="recordsPageSize">
+                                <option value="100">每页100条</option>
+                                <option value="200">每页200条</option>
+                                <option value="300">每页300条</option>
+                                <option value="500">每页500条</option>
+                            </select>
+                            <button onclick="searchRecords(1)" class="btn btn-primary">查询</button>
+                        </div>
+                    </div>
+                    <div id="recordsPagination" class="pagination" style="display: none;">
+                        <span id="recordsPageInfo"></span>
+                        <button id="recordsPrevBtn" onclick="recordsPrevPage()" class="btn btn-sm">上一页</button>
+                        <button id="recordsNextBtn" onclick="recordsNextPage()" class="btn btn-sm">下一页</button>
+                    </div>
+                    <div id="recordsContent">
+                        <div class="hint-box">
+                            <p>请选择同步组并设置过滤条件后查询</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 详情弹窗 -->
+    <dialog id="detailDialog" class="dialog">
+        <div class="dialog-header">
+            <h3 id="detailDialogTitle">详情</h3>
+            <button class="dialog-close" onclick="closeDetailDialog()">×</button>
+        </div>
+        <div class="dialog-content" id="detailDialogContent">
+        </div>
+        <div class="dialog-footer">
+            <button class="btn" onclick="closeDetailDialog()">关闭</button>
+        </div>
+    </dialog>
+
+    <script src="app.js"></script>
+</body>
+</html>

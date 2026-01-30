@@ -1,0 +1,14 @@
+{
+  "name": "meituan-sync-diagnostic",
+  "version": "1.0.0",
+  "description": "美团同步工具诊断服务 - 用于分析客户数据排查库存不一致问题",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --data-dir=\"../../meituan-sync-tool\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "express": "^4.18.2"
+  }
+}

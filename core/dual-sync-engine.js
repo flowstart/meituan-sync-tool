@@ -731,7 +731,7 @@ class DualSyncEngine {
             // 计算“工具写入窗口”对应的指纹过滤集合（用于过滤回流的【API】【子门店】）
             const TOOL_DELAY_MS = 30 * 60 * 1000; // 你观测的最大落地延迟：<=30分钟
             const TOOL_PAD_BEFORE_MS = 5 * 60 * 1000;
-            const buildFingerprintSet = (destSide, applyStartIso, applyEndIso) => {
+            const buildFingerprintMap = (destSide, applyStartIso, applyEndIso) => {
                 try {
                     if (!applyStartIso || !applyEndIso) return null;
                     const s = new Date(applyStartIso);
@@ -739,18 +739,18 @@ class DualSyncEngine {
                     if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return null;
                     const windowStart = toLocalISOString(new Date(s.getTime() - TOOL_PAD_BEFORE_MS));
                     const windowEnd = toLocalISOString(new Date(e.getTime() + TOOL_DELAY_MS));
-                    const set = this.db.getDualSyncAppliedFingerprints(this.groupId, destSide, windowStart, windowEnd);
-                    this._log('info', `[指纹过滤] destSide=${destSide}, window=${windowStart}~${windowEnd}, 指纹数=${set.size}`);
-                    return set;
+                    const map = this.db.getDualSyncAppliedFingerprints(this.groupId, destSide, windowStart, windowEnd);
+                    this._log('info', `[指纹过滤] destSide=${destSide}, window=${windowStart}~${windowEnd}, 指纹数=${map.size}`);
+                    return map;
                 } catch (e) {
                     return null;
                 }
             };
 
             // 查询 A 侧饿了么时，需要过滤“上一轮 B→A 写入”回流（destSide=A）
-            const aFingerprintSet = buildFingerprintSet('A', lastAApplyStartTime, lastAApplyEndTime);
+            const aFingerprintMap = buildFingerprintMap('A', lastAApplyStartTime, lastAApplyEndTime);
             // 查询 B 侧饿了么时，需要过滤“上一轮 A→B 写入”回流（destSide=B）
-            const bFingerprintSet = buildFingerprintSet('B', lastBApplyStartTime, lastBApplyEndTime);
+            const bFingerprintMap = buildFingerprintMap('B', lastBApplyStartTime, lastBApplyEndTime);
 
             // 打印查询时间范围（方便核对）
             this._log('info', `查询时间范围: ${toLocalISOString(new Date(aStartTime * 1000))} ~ ${toLocalISOString(new Date(now * 1000))}`);
@@ -760,7 +760,7 @@ class DualSyncEngine {
             this._log('info', '步骤1: 查询A饿了么操作记录...');
             this._progress(10, '查询A饿了么变化...');
             
-            const aQueryResult = await this._queryChanges(this.elemeA, aStartTime, now, 'A', { excludeFingerprints: aFingerprintSet });
+            const aQueryResult = await this._queryChanges(this.elemeA, aStartTime, now, 'A', { excludeFingerprintMap: aFingerprintMap });
             const aElemeChanges = aQueryResult.changes;
             const aTraceData = aQueryResult.traceData;
             this._log('info', `A饿了么提取到 ${Object.keys(aElemeChanges).length} 个商品变化`);
@@ -771,7 +771,7 @@ class DualSyncEngine {
             this._log('info', '步骤2: 查询B饿了么操作记录...');
             this._progress(20, '查询B饿了么变化...');
             
-            const bQueryResult = await this._queryChanges(this.elemeB, bStartTime, now, 'B', { excludeFingerprints: bFingerprintSet });
+            const bQueryResult = await this._queryChanges(this.elemeB, bStartTime, now, 'B', { excludeFingerprintMap: bFingerprintMap });
             const bChanges = bQueryResult.changes;
             const bTraceData = bQueryResult.traceData;
             this._log('info', `B饿了么提取到 ${Object.keys(bChanges).length} 个商品变化`);
@@ -1244,14 +1244,100 @@ class DualSyncEngine {
 
         // 去重：按条形码 + 旧库存 + 新库存 去重，避免重复记录导致重复扣减
         // 对于多规格商品，每个规格单独去重
-        const seenKeys = new Set();
+        // 新逻辑：Map<dedupeKey, {platform: [{opTimeMs}], api: [{opTimeMs}], other: [{opTimeMs}]}>
+        const seenRecords = new Map();
         const skippedLogs = []; // 记录因字段缺失而跳过的记录
         const changes = {}; // 直接在这里汇总，避免重复遍历
         let totalProcessed = 0;
         let duplicateCount = 0;
         let multiSpecCount = 0;
         let filteredByFingerprint = 0;
-        const excludeFingerprints = options && options.excludeFingerprints instanceof Set ? options.excludeFingerprints : null;
+        let fingerprintTimeSkipped = 0; // 指纹命中但时间差超过阈值，视为真实变更
+        const excludeFingerprintMap = options && options.excludeFingerprintMap instanceof Map ? options.excludeFingerprintMap : null;
+        // 从全局配置读取阈值（分钟），默认 5 分钟
+        let fingerprintThresholdMinutes = 5;
+        try {
+            const raw = this.db.getConfig('dual_fingerprint_time_threshold_minutes', '5');
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n > 0) {
+                fingerprintThresholdMinutes = n;
+            }
+        } catch (_) {}
+        // 兜底保护：限制在 1~60 分钟
+        fingerprintThresholdMinutes = Math.max(1, Math.min(60, fingerprintThresholdMinutes));
+        const FINGERPRINT_TIME_THRESHOLD_MS = fingerprintThresholdMinutes * 60 * 1000;
+
+        // 从全局配置读取平台订单去重时间差阈值（秒），默认 10 秒
+        let platformDedupThresholdSeconds = 10;
+        try {
+            const raw = this.db.getConfig('platform_dedup_time_threshold_seconds', '10');
+            const n = parseInt(raw, 10);
+            if (Number.isFinite(n) && n > 0) {
+                platformDedupThresholdSeconds = n;
+            }
+        } catch (_) {}
+        // 兜底保护：限制在 1~120 秒
+        platformDedupThresholdSeconds = Math.max(1, Math.min(120, platformDedupThresholdSeconds));
+        const PLATFORM_DEDUP_THRESHOLD_MS = platformDedupThresholdSeconds * 1000;
+
+        // 判断记录类型的辅助函数
+        const getRecordType = (opUser) => {
+            const user = opUser || '';
+            if (user.includes('【平台】')) return 'platform';
+            if (user.includes('【API】')) return 'api';
+            return 'other';
+        };
+
+        // 检查是否重复的辅助函数
+        const checkDuplicate = (dedupeKey, opTimeMs, recordType) => {
+            if (!seenRecords.has(dedupeKey)) {
+                return false;
+            }
+            const seen = seenRecords.get(dedupeKey);
+            const sameTypeList = seen[recordType] || [];
+            
+            if (recordType === 'api') {
+                // API：时间必须完全一致才算重复
+                return sameTypeList.some(r => r.opTimeMs === opTimeMs);
+            } else if (recordType === 'platform') {
+                // 平台：时间差 <= 阈值才算重复
+                return sameTypeList.some(r => 
+                    Math.abs(r.opTimeMs - opTimeMs) <= PLATFORM_DEDUP_THRESHOLD_MS
+                );
+            } else {
+                // 其他类型：保持原逻辑，简单去重
+                return sameTypeList.length > 0;
+            }
+        };
+
+        // 记录到 seenRecords 的辅助函数
+        const addToSeenRecords = (dedupeKey, opTimeMs, recordType) => {
+            if (!seenRecords.has(dedupeKey)) {
+                seenRecords.set(dedupeKey, { platform: [], api: [], other: [] });
+            }
+            seenRecords.get(dedupeKey)[recordType].push({ opTimeMs });
+        };
+
+        // 生成去重过滤原因的辅助函数
+        const getDedupFilterReason = (recordType) => {
+            if (recordType === 'api') {
+                return 'API订单重复（时间完全一致）';
+            } else if (recordType === 'platform') {
+                return `平台订单重复（时间差<=${platformDedupThresholdSeconds}秒）`;
+            } else {
+                return '重复记录';
+            }
+        };
+
+        const getOpTimeMs = (opTime) => {
+            // ElemeParser.parseOperationLog 会把 op_time 解析成 Date；这里做兼容
+            if (!opTime) return NaN;
+            if (opTime instanceof Date) return opTime.getTime();
+            // 兜底：字符串/数字都转字符串尝试解析
+            const s = String(opTime);
+            // Safari 对 `YYYY-MM-DD HH:mm:ss` 兼容差，做 replace
+            return new Date(s.replace(/-/g, '/')).getTime();
+        };
         
         for (const log of candidateLogs) {
             // 多规格商品处理
@@ -1268,35 +1354,55 @@ class DualSyncEngine {
                     // 记录原始记录（追溯用）
                     const rawRecord = {
                         barcode,
+                        bizId: log.biz_id,           // 商品ID
+                        eleBizId: log.ele_biz_id,    // 饿了么商品ID
                         oldStock: stockChange.old_stock,
                         newStock: stockChange.new_stock,
                         change: stockChange.change,
                         opTime: log.op_time,
                         opUser: log.op_user,
+                        opContent: log.op_content,   // 保存原始内容便于追溯
                         isMultiSpec: true
                     };
                     traceData.rawRecords.push(rawRecord);
 
-                    // 工具回流过滤：命中指纹则跳过
-                    if (excludeFingerprints && excludeFingerprints.has(dedupeKey)) {
-                        filteredByFingerprint++;
-                        traceData.filteredByFingerprint.push({
-                            ...rawRecord,
-                            filterReason: '指纹匹配'
+                    // 工具回流过滤：命中指纹且时间差在阈值内才跳过
+                    if (excludeFingerprintMap && excludeFingerprintMap.has(dedupeKey)) {
+                        const appliedAtList = excludeFingerprintMap.get(dedupeKey);
+                        const opTimeMs = getOpTimeMs(log.op_time);
+                        // 检查是否有任意一个 appliedAt 与 opTime 时间差在阈值内
+                        const isWithinThreshold = appliedAtList.some(appliedAt => {
+                            const appliedAtMs = new Date(appliedAt).getTime();
+                            return !Number.isNaN(opTimeMs) && !Number.isNaN(appliedAtMs) &&
+                                   Math.abs(opTimeMs - appliedAtMs) <= FINGERPRINT_TIME_THRESHOLD_MS;
                         });
-                        continue;
+                        
+                        if (isWithinThreshold) {
+                            filteredByFingerprint++;
+                            traceData.filteredByFingerprint.push({
+                                ...rawRecord,
+                                filterReason: `指纹匹配且时间差在${fingerprintThresholdMinutes}分钟内`
+                            });
+                            continue;
+                        } else {
+                            // 指纹命中但时间差超过阈值，视为真实变更，不过滤
+                            fingerprintTimeSkipped++;
+                        }
                     }
                     
-                    if (seenKeys.has(dedupeKey)) {
+                    // 去重判断：根据 opUser 类型区分
+                    const opTimeMs = getOpTimeMs(log.op_time);
+                    const recordType = getRecordType(log.op_user);
+                    if (checkDuplicate(dedupeKey, opTimeMs, recordType)) {
                         duplicateCount++;
                         traceData.filteredByDedup.push({
                             ...rawRecord,
-                            filterReason: '重复记录'
+                            filterReason: getDedupFilterReason(recordType)
                         });
                         continue;
                     }
                     
-                    seenKeys.add(dedupeKey);
+                    addToSeenRecords(dedupeKey, opTimeMs, recordType);
                     totalProcessed++;
                     
                     // 汇总变化量
@@ -1338,35 +1444,55 @@ class DualSyncEngine {
             // 记录原始记录（追溯用）
             const rawRecord = {
                 barcode: log.barcode,
+                bizId: log.biz_id,           // 商品ID
+                eleBizId: log.ele_biz_id,    // 饿了么商品ID
                 oldStock: log.stock_change.old_stock,
                 newStock: log.stock_change.new_stock,
                 change: log.stock_change.change,
                 opTime: log.op_time,
                 opUser: log.op_user,
+                opContent: log.op_content,   // 保存原始内容便于追溯
                 isMultiSpec: false
             };
             traceData.rawRecords.push(rawRecord);
 
-            // 工具回流过滤：命中指纹则跳过
-            if (excludeFingerprints && excludeFingerprints.has(dedupeKey)) {
-                filteredByFingerprint++;
-                traceData.filteredByFingerprint.push({
-                    ...rawRecord,
-                    filterReason: '指纹匹配'
+            // 工具回流过滤：命中指纹且时间差在阈值内才跳过
+            if (excludeFingerprintMap && excludeFingerprintMap.has(dedupeKey)) {
+                const appliedAtList = excludeFingerprintMap.get(dedupeKey);
+                const opTimeMs = getOpTimeMs(log.op_time);
+                // 检查是否有任意一个 appliedAt 与 opTime 时间差在阈值内
+                const isWithinThreshold = appliedAtList.some(appliedAt => {
+                    const appliedAtMs = new Date(appliedAt).getTime();
+                    return !Number.isNaN(opTimeMs) && !Number.isNaN(appliedAtMs) &&
+                           Math.abs(opTimeMs - appliedAtMs) <= FINGERPRINT_TIME_THRESHOLD_MS;
                 });
-                continue;
+                
+                if (isWithinThreshold) {
+                    filteredByFingerprint++;
+                    traceData.filteredByFingerprint.push({
+                        ...rawRecord,
+                        filterReason: `指纹匹配且时间差在${fingerprintThresholdMinutes}分钟内`
+                    });
+                    continue;
+                } else {
+                    // 指纹命中但时间差超过阈值，视为真实变更，不过滤
+                    fingerprintTimeSkipped++;
+                }
             }
             
-            if (seenKeys.has(dedupeKey)) {
+            // 去重判断：根据 opUser 类型区分
+            const opTimeMsSingle = getOpTimeMs(log.op_time);
+            const recordTypeSingle = getRecordType(log.op_user);
+            if (checkDuplicate(dedupeKey, opTimeMsSingle, recordTypeSingle)) {
                 duplicateCount++;
                 traceData.filteredByDedup.push({
                     ...rawRecord,
-                    filterReason: '重复记录'
+                    filterReason: getDedupFilterReason(recordTypeSingle)
                 });
                 continue;
             }
             
-            seenKeys.add(dedupeKey);
+            addToSeenRecords(dedupeKey, opTimeMsSingle, recordTypeSingle);
             totalProcessed++;
             
             // 汇总变化量
@@ -1394,6 +1520,9 @@ class DualSyncEngine {
         }
         if (filteredByFingerprint > 0) {
             this._log('info', `[${side}饿了么] 指纹过滤: 移除 ${filteredByFingerprint} 条工具回流记录`);
+        }
+        if (fingerprintTimeSkipped > 0) {
+            this._log('info', `[${side}饿了么] 指纹时间校验: ${fingerprintTimeSkipped} 条记录命中指纹但时间差>${fingerprintThresholdMinutes}分钟，视为真实变更`);
         }
         this._log('info', `[${side}饿了么] 有效变化: ${totalProcessed} 条，涉及 ${Object.keys(changes).length} 个商品`);
 

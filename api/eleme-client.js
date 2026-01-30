@@ -9,6 +9,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const { StringDecoder } = require('string_decoder');
 
 class ElemeClient {
     /**
@@ -168,14 +169,17 @@ class ElemeClient {
                 console.log(`[Eleme] 请求数据: ${dataStr.substring(0, 200)}${dataStr.length > 200 ? '...' : ''}`);
 
                 const req = https.request(options, (res) => {
+                    // 用 StringDecoder 处理 UTF-8 多字节跨 chunk 边界问题，避免出现 U+FFFD（�）导致日志“乱码”
+                    const decoder = new StringDecoder('utf8');
                     let body = '';
 
                     res.on('data', (chunk) => {
-                        body += chunk;
+                        body += decoder.write(chunk);
                     });
 
                     res.on('end', () => {
                         try {
+                            body += decoder.end();
                             if (!body || body.trim() === '') {
                                 reject(new Error('服务器返回空响应'));
                                 return;
@@ -604,14 +608,17 @@ class ElemeClient {
                 };
 
                 const req = https.request(options, (res) => {
+                    // 用 StringDecoder 处理 UTF-8 多字节跨 chunk 边界问题，避免出现 U+FFFD（�）
+                    const decoder = new StringDecoder('utf8');
                     let body = '';
 
                     res.on('data', (chunk) => {
-                        body += chunk;
+                        body += decoder.write(chunk);
                     });
 
                     res.on('end', () => {
                         try {
+                            body += decoder.end();
                             if (!body || body.trim() === '') {
                                 resolve({
                                     success: false,

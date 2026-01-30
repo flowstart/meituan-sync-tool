@@ -13,7 +13,9 @@ let globalConfig = {
     incrementalInterval: 10,
     batchConcurrency: 3,
     debugMode: false,
-    cookiesCheckInterval: 24
+    cookiesCheckInterval: 24,
+    dualFingerprintTimeThresholdMinutes: 5,
+    platformDedupTimeThresholdSeconds: 10
 };
 // 运行状态缓存：避免重新渲染时丢失同步状态与按钮隐藏
 // 结构: { [groupId]: { syncing: boolean, type: 'full'|'incremental', progress?: number, message?: string } }
@@ -80,6 +82,11 @@ function updateStatusBar(customMessage = null) {
 
 function initIPCListeners() {
     console.log('🔌 初始化IPC监听...');
+    // 防止重复注册导致监听器叠加（可能造成日志倍增、内存增长）
+    if (window.__ipcListenersInitialized) {
+        return;
+    }
+    window.__ipcListenersInitialized = true;
 
     // 监听实时日志
     ipcRenderer.on('sync-log', (event, logEntry) => {
@@ -635,6 +642,86 @@ async function duplicateGroup(groupId) {
 
 // ==================== 日志管理 ====================
 
+// 单向日志：增量渲染 + 批处理 flush
+const LOGS_MAX_DOM_LINES = 1000;
+const LOGS_FLUSH_THROTTLE_MS = 300;
+let _logsFlushTimer = null;
+let _logsFlushScheduled = false;
+const _pendingLogsByGroup = new Map(); // groupId -> [{timestamp, level, message}]
+
+function _isScrolledToBottom(el, thresholdPx = 8) {
+    if (!el) return true;
+    const diff = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return diff <= thresholdPx;
+}
+
+function _ensureLogsDOMForGroup(groupId) {
+    // 确保 logsContainer 存在对应组的 log-content 容器
+    const container = document.getElementById('logsContainer');
+    if (!container) return null;
+
+    let contentEl = document.getElementById(`logContent_${groupId}`);
+    if (!contentEl) {
+        // UI 可能尚未渲染或组列表变化，先触发一次全量渲染创建容器
+        renderLogs();
+        contentEl = document.getElementById(`logContent_${groupId}`);
+    }
+    return contentEl || null;
+}
+
+function _appendLogLines(groupId, entries) {
+    const contentEl = _ensureLogsDOMForGroup(groupId);
+    if (!contentEl) return;
+
+    // 仅当用户已在底部时自动滚动到底部
+    const shouldAutoScroll = _isScrolledToBottom(contentEl);
+
+    // 如果当前是“暂无日志”的占位行，先清空
+    if (contentEl.dataset.placeholder === 'true') {
+        contentEl.innerHTML = '';
+        delete contentEl.dataset.placeholder;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const log of entries) {
+        const line = document.createElement('div');
+        line.className = 'log-line';
+        const bj = formatBeijingTime(log.timestamp);
+        line.innerHTML = `
+            <span class="log-time">${bj}</span> |
+            <span class="log-level-${log.level}">${String(log.level).toUpperCase()}</span> |
+            ${log.message}
+        `;
+        frag.appendChild(line);
+    }
+    contentEl.appendChild(frag);
+
+    // DOM 上限控制
+    while (contentEl.children.length > LOGS_MAX_DOM_LINES) {
+        contentEl.removeChild(contentEl.firstChild);
+    }
+
+    if (shouldAutoScroll) {
+        contentEl.scrollTop = contentEl.scrollHeight;
+    }
+}
+
+function _scheduleLogsFlush() {
+    if (_logsFlushScheduled) return;
+    _logsFlushScheduled = true;
+    _logsFlushTimer = setTimeout(() => {
+        _logsFlushScheduled = false;
+        _logsFlushTimer = null;
+
+        for (const [groupId, list] of _pendingLogsByGroup.entries()) {
+            _pendingLogsByGroup.delete(groupId);
+            if (list && list.length > 0) {
+                _appendLogLines(groupId, list);
+            }
+        }
+    }, LOGS_FLUSH_THROTTLE_MS);
+}
+
 function addLog(groupId, level, message) {
     if (!logs[groupId]) {
         logs[groupId] = [];
@@ -649,7 +736,12 @@ function addLog(groupId, level, message) {
         logs[groupId].shift();
     }
 
-    renderLogs();
+    // 增量渲染：按组批处理追加，避免每条日志触发全量重渲染
+    if (!_pendingLogsByGroup.has(groupId)) {
+        _pendingLogsByGroup.set(groupId, []);
+    }
+    _pendingLogsByGroup.get(groupId).push({ timestamp, level, message });
+    _scheduleLogsFlush();
 }
 
 function renderLogs() {
@@ -700,7 +792,7 @@ function renderLogs() {
                         <button class="log-btn" onclick="exportGroupLogs(${groupId})">导出</button>
                     </div>
                 </div>
-                <div class="log-content">
+                <div class="log-content" id="logContent_${groupId}" ${logList.length === 0 ? 'data-placeholder=\"true\"' : ''}>
                     ${contentHtml}
                 </div>
             </div>
@@ -1626,6 +1718,8 @@ async function loadConfigToForm() {
         document.getElementById('batchConcurrency').value = config.batchConcurrency || 3;
         document.getElementById('debugMode').checked = config.debugMode || false;
         document.getElementById('cookiesCheckInterval').value = config.cookiesCheckInterval || 24;
+        document.getElementById('dualFingerprintTimeThresholdMinutes').value = config.dualFingerprintTimeThresholdMinutes || 5;
+        document.getElementById('platformDedupTimeThresholdSeconds').value = config.platformDedupTimeThresholdSeconds || 10;
         
         // 获取并显示用户数据路径
         try {
@@ -1652,7 +1746,9 @@ async function saveConfig() {
             incrementalInterval: parseInt(document.getElementById('incrementalInterval').value) || 10,
             batchConcurrency: parseInt(document.getElementById('batchConcurrency').value) || 3,
             debugMode: document.getElementById('debugMode').checked,
-            cookiesCheckInterval: parseInt(document.getElementById('cookiesCheckInterval').value) || 24
+            cookiesCheckInterval: parseInt(document.getElementById('cookiesCheckInterval').value) || 24,
+            dualFingerprintTimeThresholdMinutes: parseInt(document.getElementById('dualFingerprintTimeThresholdMinutes').value) || 5,
+            platformDedupTimeThresholdSeconds: parseInt(document.getElementById('platformDedupTimeThresholdSeconds').value) || 10
         };
         
         // 验证配置
@@ -1668,6 +1764,16 @@ async function saveConfig() {
         
         if (config.cookiesCheckInterval < 1 || config.cookiesCheckInterval > 168) {
             alert('Cookies检测间隔必须在1-168小时之间');
+            return;
+        }
+
+        if (config.dualFingerprintTimeThresholdMinutes < 1 || config.dualFingerprintTimeThresholdMinutes > 60) {
+            alert('双向同步回流过滤时间差阈值必须在1-60分钟之间');
+            return;
+        }
+
+        if (config.platformDedupTimeThresholdSeconds < 1 || config.platformDedupTimeThresholdSeconds > 120) {
+            alert('平台订单去重时间差阈值必须在1-120秒之间');
             return;
         }
         
@@ -1695,6 +1801,8 @@ function resetConfig() {
         document.getElementById('batchConcurrency').value = 3;
         document.getElementById('debugMode').checked = false;
         document.getElementById('cookiesCheckInterval').value = 24;
+        document.getElementById('dualFingerprintTimeThresholdMinutes').value = 5;
+        document.getElementById('platformDedupTimeThresholdSeconds').value = 10;
         
         console.log('配置已恢复为默认值');
         alert('✅ 已恢复默认配置，请点击「保存配置」按钮保存');
@@ -1753,6 +1861,12 @@ let dualSyncQnhStores = { a: [], b: [] }; // 牵牛花门店列表缓存
 
 // 初始化双向同步IPC监听
 function initDualSyncIPCListeners() {
+    // 防止重复注册导致监听器叠加（可能造成日志倍增、内存增长）
+    if (window.__dualSyncIpcListenersInitialized) {
+        return;
+    }
+    window.__dualSyncIpcListenersInitialized = true;
+
     // 监听双向同步日志
     ipcRenderer.on('dual-sync-log', (event, logEntry) => {
         console.log('[双向同步日志]', logEntry);
@@ -2013,6 +2127,82 @@ function updateDualSyncLogProgressUI(groupId, progress, message) {
 }
 
 // 添加双向同步日志
+const DUAL_SYNC_LOGS_MAX_DOM_LINES = 200;
+const DUAL_SYNC_LOGS_FLUSH_THROTTLE_MS = 300;
+let _dualLogsFlushTimer = null;
+let _dualLogsFlushScheduled = false;
+const _pendingDualLogsByGroup = new Map(); // groupId -> [{timestamp, level, message}]
+
+function _ensureDualLogsLinesContainer(groupId) {
+    let linesEl = document.getElementById(`dualSyncLogLines_${groupId}`);
+    if (!linesEl) {
+        // UI 可能尚未渲染或组列表变化，先触发一次全量渲染创建容器
+        renderDualSyncLogs();
+        linesEl = document.getElementById(`dualSyncLogLines_${groupId}`);
+    }
+    return linesEl || null;
+}
+
+function _appendDualSyncLogLines(groupId, entries) {
+    const linesEl = _ensureDualLogsLinesContainer(groupId);
+    if (!linesEl) return;
+
+    const contentEl = document.getElementById(`dualSyncLogContent_${groupId}`) || linesEl.parentElement;
+    const shouldAutoScroll = _isScrolledToBottom(contentEl);
+
+    if (linesEl.dataset.placeholder === 'true') {
+        linesEl.innerHTML = '';
+        delete linesEl.dataset.placeholder;
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const log of entries) {
+        const line = document.createElement('div');
+        line.className = 'log-line';
+
+        // 检测 [!red] 标记，用红色显示
+        let message = log.message;
+        let messageStyle = '';
+        if (typeof message === 'string' && message.startsWith('[!red]')) {
+            message = message.replace('[!red]', '');
+            messageStyle = 'color: #e57373;';
+        }
+
+        line.innerHTML = `
+            <span class="log-time">${log.timestamp}</span> |
+            <span class="log-level-${log.level}">${String(log.level).toUpperCase()}</span> |
+            <span style="${messageStyle}">${message}</span>
+        `;
+        frag.appendChild(line);
+    }
+    linesEl.appendChild(frag);
+
+    // DOM 上限控制
+    while (linesEl.children.length > DUAL_SYNC_LOGS_MAX_DOM_LINES) {
+        linesEl.removeChild(linesEl.firstChild);
+    }
+
+    if (shouldAutoScroll) {
+        contentEl.scrollTop = contentEl.scrollHeight;
+    }
+}
+
+function _scheduleDualLogsFlush() {
+    if (_dualLogsFlushScheduled) return;
+    _dualLogsFlushScheduled = true;
+    _dualLogsFlushTimer = setTimeout(() => {
+        _dualLogsFlushScheduled = false;
+        _dualLogsFlushTimer = null;
+
+        for (const [groupId, list] of _pendingDualLogsByGroup.entries()) {
+            _pendingDualLogsByGroup.delete(groupId);
+            if (list && list.length > 0) {
+                _appendDualSyncLogLines(groupId, list);
+            }
+        }
+    }, DUAL_SYNC_LOGS_FLUSH_THROTTLE_MS);
+}
+
 function addDualSyncLog(groupId, level, message) {
     if (!dualSyncLogs[groupId]) {
         dualSyncLogs[groupId] = [];
@@ -2026,8 +2216,12 @@ function addDualSyncLog(groupId, level, message) {
         dualSyncLogs[groupId].shift();
     }
     
-    // 更新日志显示（所有组的日志都需要显示）
-    renderDualSyncLogs(groupId);
+    // 增量渲染：按组批处理追加，避免每条日志触发全量重渲染
+    if (!_pendingDualLogsByGroup.has(groupId)) {
+        _pendingDualLogsByGroup.set(groupId, []);
+    }
+    _pendingDualLogsByGroup.get(groupId).push({ timestamp, level, message });
+    _scheduleDualLogsFlush();
 }
 
 // 加载双向同步组日志
@@ -2108,7 +2302,7 @@ function renderDualSyncLogs(groupId) {
                         </div>
                         <div class="dual-sync-log-progress-text">${initialMessage ? `${Math.min(100, Math.max(0, Number(initialProgress) || 0))}% · ${initialMessage}` : `${Math.min(100, Math.max(0, Number(initialProgress) || 0))}%`}</div>
                     </div>
-                    ${contentHtml}
+                    <div id="dualSyncLogLines_${gId}" ${logList.length === 0 ? 'data-placeholder=\"true\"' : ''}>${contentHtml}</div>
                 </div>
             </div>
         `;
@@ -2687,18 +2881,26 @@ window.copyTraceDetail = copyTraceDetail;
 let currentTraceGroupId = null;
 let currentTraceBarcode = null;
 let currentTraceDetailData = null;
+let currentTraceData = null;  // 存储完整的查询结果
+let currentTraceTab = 'all';  // 当前选中的 Tab
 
 // 打开追溯查询对话框
 function openTraceQueryDialog(groupId) {
     currentTraceGroupId = groupId;
     currentTraceBarcode = null;
+    currentTraceData = null;
+    currentTraceTab = 'all';
     
     const dialog = document.getElementById('traceQueryDialog');
     const barcodeInput = document.getElementById('traceBarcodeInput');
     const resultContainer = document.getElementById('traceQueryResult');
+    const productInfo = document.getElementById('traceProductInfo');
+    const tabsContainer = document.getElementById('traceTabsContainer');
     
     // 重置状态
     barcodeInput.value = '';
+    productInfo.style.display = 'none';
+    tabsContainer.style.display = 'none';
     resultContainer.innerHTML = `
         <div style="text-align: center; color: #999; padding: 40px;">
             <p>请输入条形码查询商品的同步历史</p>
@@ -2714,12 +2916,15 @@ function closeTraceQueryDialog() {
     const dialog = document.getElementById('traceQueryDialog');
     dialog.close();
     currentTraceGroupId = null;
+    currentTraceData = null;
 }
 
 // 执行追溯查询
 async function executeTraceQuery() {
     const barcode = document.getElementById('traceBarcodeInput').value.trim();
     const resultContainer = document.getElementById('traceQueryResult');
+    const productInfo = document.getElementById('traceProductInfo');
+    const tabsContainer = document.getElementById('traceTabsContainer');
     
     if (!barcode) {
         alert('请输入条形码');
@@ -2727,12 +2932,16 @@ async function executeTraceQuery() {
     }
     
     currentTraceBarcode = barcode;
+    currentTraceTab = 'all';
+    productInfo.style.display = 'none';
+    tabsContainer.style.display = 'none';
     resultContainer.innerHTML = '<div style="text-align: center; padding: 20px; color: #999;">查询中...</div>';
     
     try {
         const result = await ipcRenderer.invoke('dual-sync-get-trace-by-barcode', {
             groupId: currentTraceGroupId,
-            barcode: barcode
+            barcode: barcode,
+            includeRawRecords: true
         });
         
         if (!result.success) {
@@ -2740,157 +2949,262 @@ async function executeTraceQuery() {
             return;
         }
         
+        currentTraceData = result.data;
         renderTraceQueryResult(result.data, barcode);
     } catch (error) {
         resultContainer.innerHTML = `<div style="color: #f5222d; padding: 20px;">查询失败: ${error.message}</div>`;
     }
 }
 
+// Tab 切换
+function switchTraceTab(tab) {
+    currentTraceTab = tab;
+    
+    // 更新 Tab 按钮样式
+    document.querySelectorAll('.trace-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tab);
+    });
+    
+    // 重新渲染表格
+    if (currentTraceData) {
+        renderTraceTable(currentTraceData, currentTraceBarcode, tab);
+    }
+}
+window.switchTraceTab = switchTraceTab;
+
 // 渲染追溯查询结果
 function renderTraceQueryResult(data, barcode) {
     const resultContainer = document.getElementById('traceQueryResult');
-    const { fullSyncBaseline, incrementalRecords, isFullSyncOlderThan30Days } = data;
+    const productInfo = document.getElementById('traceProductInfo');
+    const tabsContainer = document.getElementById('traceTabsContainer');
+    const { fullSyncBaseline, incrementalRecords, isFullSyncOlderThan30Days, rawRecordsDetail } = data;
     
-    let html = '';
+    // 计算各 Tab 的记录数
+    const allCount = rawRecordsDetail?.rawRecords?.length || 0;
+    const appliedCount = rawRecordsDetail?.appliedRecords?.length || 0;
+    const filteredCount = rawRecordsDetail?.filteredRecords?.length || 0;
+    const deduplicatedCount = rawRecordsDetail?.deduplicatedRecords?.length || 0;
     
-    // 30天警告提示
-    if (isFullSyncOlderThan30Days) {
-        html += `
-            <div style="background: #fff7e6; border: 1px solid #ffd591; border-radius: 4px; padding: 12px; margin-bottom: 15px;">
-                <span style="color: #fa8c16;">⚠️ 数据仅保留30天，只能查询近30天的记录</span>
-            </div>
-        `;
-    }
+    // 更新 Tab 计数
+    document.getElementById('traceTabCountAll').textContent = allCount;
+    document.getElementById('traceTabCountApplied').textContent = appliedCount;
+    document.getElementById('traceTabCountFiltered').textContent = filteredCount;
+    document.getElementById('traceTabCountDeduplicated').textContent = deduplicatedCount;
     
-    // 商品信息
+    // 重置 Tab 状态
+    document.querySelectorAll('.trace-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === 'all');
+    });
+    
+    // 商品信息区域
     const productName = fullSyncBaseline?.product_name || incrementalRecords[0]?.product_name || '未知商品';
-    html += `
-        <div style="background: #f5f5f5; padding: 15px; border-radius: 4px; margin-bottom: 15px;">
-            <div style="font-size: 14px; font-weight: bold;">商品条形码: ${barcode}</div>
-            <div style="font-size: 13px; color: #666; margin-top: 4px;">商品名称: ${productName}</div>
-        </div>
+    let productHtml = `
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <div style="font-size: 14px; font-weight: bold;">商品条形码: ${barcode}</div>
+                <div style="font-size: 13px; color: #666; margin-top: 4px;">商品名称: ${productName}</div>
+            </div>
     `;
     
     // 全量同步基准
     if (fullSyncBaseline) {
         const time = new Date(fullSyncBaseline.created_at).toLocaleString('zh-CN');
         const baseStock = fullSyncBaseline.current_stock ?? fullSyncBaseline.target_stock ?? '-';
-        html += `
-            <div style="background: #e6f7ff; border: 1px solid #91d5ff; border-radius: 4px; padding: 12px; margin-bottom: 15px;">
-                <div style="font-weight: bold; margin-bottom: 8px;">📌 全量同步基准</div>
-                <div>时间: ${time}</div>
-                <div>基准库存: <strong style="color: #1890ff; font-size: 16px;">${baseStock}</strong></div>
+        productHtml += `
+            <div style="text-align: right;">
+                <div style="font-size: 12px; color: #666;">全量同步基准 (${time})</div>
+                <div style="font-size: 18px; font-weight: bold; color: #1890ff;">${baseStock}</div>
             </div>
         `;
-    } else {
-        html += `
-            <div style="background: #fffbe6; border: 1px solid #ffe58f; border-radius: 4px; padding: 12px; margin-bottom: 15px;">
-                <span style="color: #d48806;">⚠️ 未找到该商品的全量同步记录</span>
+    }
+    productHtml += '</div>';
+    
+    // 30天警告
+    if (isFullSyncOlderThan30Days) {
+        productHtml += `
+            <div style="background: #fff7e6; padding: 8px; border-radius: 4px; margin-top: 10px; font-size: 12px; color: #fa8c16;">
+                ⚠️ 数据仅保留30天，只能查询近30天的记录
             </div>
         `;
     }
     
-    // 增量同步记录
-    if (incrementalRecords.length > 0) {
-        html += `
-            <div style="font-weight: bold; margin-bottom: 10px;">📋 增量同步记录 (${incrementalRecords.length}条)</div>
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-                <thead>
-                    <tr style="background: #fafafa;">
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: left;">时间</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">方向</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: right;">变化量</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">过滤</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">去重</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">结果</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: right;">目标库存</th>
-                        <th style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">详情</th>
-                    </tr>
-                </thead>
-                <tbody>
+    if (!fullSyncBaseline) {
+        productHtml += `
+            <div style="background: #fffbe6; padding: 8px; border-radius: 4px; margin-top: 10px; font-size: 12px; color: #d48806;">
+                ⚠️ 未找到该商品的全量同步记录
+            </div>
         `;
-        
-        for (const record of incrementalRecords) {
-            const time = new Date(record.created_at).toLocaleString('zh-CN');
-            const direction = record.direction === 'A->B' ? 'A→B' : 'B→A';
-            const change = record.source_total_change;
-            const changeColor = change > 0 ? 'green' : (change < 0 ? 'red' : 'gray');
-            const changeText = change > 0 ? `+${change}` : `${change}`;
-            const wasFiltered = record.was_filtered ? '是' : '否';
-            const wasDeduplicated = record.was_deduplicated ? '是' : '否';
-            
-            let resultStyle = '';
-            let resultText = record.apply_result;
-            switch (record.apply_result) {
-                case 'success':
-                    resultStyle = 'color: #52c41a; font-weight: bold;';
-                    resultText = '成功';
-                    break;
-                case 'failed':
-                    resultStyle = 'color: #f5222d; font-weight: bold;';
-                    resultText = '失败';
-                    break;
-                case 'filtered':
-                    resultStyle = 'color: #faad14;';
-                    resultText = '已过滤';
-                    break;
-                case 'deduplicated':
-                    resultStyle = 'color: #722ed1;';
-                    resultText = '已去重';
-                    break;
-            }
-            
-            html += `
+    }
+    
+    productInfo.innerHTML = productHtml;
+    productInfo.style.display = 'block';
+    
+    // 显示 Tabs
+    tabsContainer.style.display = allCount > 0 ? 'block' : 'none';
+    
+    // 渲染表格
+    renderTraceTable(data, barcode, 'all');
+}
+
+// 渲染追溯表格（根据 Tab 过滤）
+function renderTraceTable(data, barcode, tab) {
+    const resultContainer = document.getElementById('traceQueryResult');
+    const { fullSyncBaseline, rawRecordsDetail } = data;
+    
+    if (!rawRecordsDetail) {
+        resultContainer.innerHTML = '<div style="text-align: center; color: #999; padding: 20px;">暂无详细记录</div>';
+        return;
+    }
+    
+    // 根据 Tab 选择数据
+    let records = [];
+    switch (tab) {
+        case 'all':
+            records = rawRecordsDetail.rawRecords || [];
+            break;
+        case 'applied':
+            records = rawRecordsDetail.appliedRecords || [];
+            break;
+        case 'filtered':
+            records = rawRecordsDetail.filteredRecords || [];
+            break;
+        case 'deduplicated':
+            records = rawRecordsDetail.deduplicatedRecords || [];
+            break;
+    }
+    
+    if (records.length === 0) {
+        resultContainer.innerHTML = `<div style="text-align: center; color: #999; padding: 20px;">暂无${getTabLabel(tab)}记录</div>`;
+        return;
+    }
+    
+    // 饿了么样式表格
+    let html = `
+        <table class="trace-table">
+            <thead>
                 <tr>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8;">${time}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">${direction}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: right; color: ${changeColor};">${changeText}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center; ${record.was_filtered ? 'color: #faad14;' : ''}">${wasFiltered}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center; ${record.was_deduplicated ? 'color: #722ed1;' : ''}">${wasDeduplicated}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center; ${resultStyle}">${resultText}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: right;">${record.target_stock ?? '-'}</td>
-                    <td style="padding: 8px; border: 1px solid #e8e8e8; text-align: center;">
-                        <button class="btn btn-small" onclick="viewTraceDetail(${record.sync_run_id})" title="查看详细日志">📄</button>
-                    </td>
+                    <th style="width: 280px;">操作描述</th>
+                    <th>条形码</th>
+                    <th>商品ID</th>
+                    <th>操作时间</th>
+                    <th>操作人</th>
+                    <th>同步状态</th>
                 </tr>
-            `;
+            </thead>
+            <tbody>
+    `;
+    
+    for (const record of records) {
+        // 解析操作描述（从 opContent 中提取库存信息）
+        const opContentHtml = formatOpContent(record.opContent, record.oldStock, record.newStock);
+        
+        // 格式化时间（转为本地时间）
+        const opTime = record.opTime ? new Date(record.opTime).toLocaleString('zh-CN') : '-';
+        
+        // 确定同步状态
+        let statusClass = '';
+        let statusText = '';
+        if (tab === 'filtered' || record.recordType === 'filtered') {
+            statusClass = 'filtered';
+            statusText = '已过滤';
+        } else if (tab === 'deduplicated' || record.recordType === 'deduplicated') {
+            statusClass = 'deduplicated';
+            statusText = '已去重';
+        } else if (record.recordType === 'applied') {
+            statusClass = record.applyResult === 'success' ? 'success' : 'failed';
+            statusText = record.applyResult === 'success' ? '已同步' : '同步失败';
+        } else {
+            // 从原始记录中判断状态
+            statusClass = 'success';
+            statusText = '待处理';
         }
         
-        html += '</tbody></table>';
-        
-        // 计算理论库存
-        if (fullSyncBaseline) {
-            const baseStock = fullSyncBaseline.current_stock ?? fullSyncBaseline.target_stock ?? 0;
-            let totalChange = 0;
-            for (const record of incrementalRecords) {
-                if (record.apply_result === 'success') {
-                    totalChange += record.source_total_change || 0;
-                }
-            }
-            const theoreticalStock = baseStock + totalChange;
-            
-            html += `
-                <div style="background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 4px; padding: 12px; margin-top: 15px;">
-                    <div style="font-weight: bold;">📊 理论库存计算</div>
-                    <div style="margin-top: 8px;">
-                        基准库存: ${baseStock} + 成功变化量: ${totalChange >= 0 ? '+' : ''}${totalChange} 
-                        = <strong style="color: #52c41a; font-size: 16px;">${theoreticalStock}</strong>
-                    </div>
-                    <div style="font-size: 12px; color: #666; margin-top: 4px;">
-                        （注: 被过滤和去重的变化量不计入）
-                    </div>
-                </div>
-            `;
-        }
-    } else {
         html += `
-            <div style="text-align: center; color: #999; padding: 20px;">
-                暂无增量同步记录
+            <tr>
+                <td class="trace-op-content">${opContentHtml}</td>
+                <td style="font-family: monospace; font-size: 12px;">${record.barcode || '-'}</td>
+                <td style="font-size: 12px; color: #666;">${record.bizId || '-'}</td>
+                <td style="white-space: nowrap;">${opTime}</td>
+                <td style="font-size: 12px; max-width: 150px; overflow: hidden; text-overflow: ellipsis;" title="${record.opUser || ''}">${record.opUser || '-'}</td>
+                <td><span class="trace-status ${statusClass}">${statusText}</span></td>
+            </tr>
+        `;
+    }
+    
+    html += '</tbody></table>';
+    
+    // 计算理论库存（仅在全部 Tab 显示）
+    if (tab === 'all' && fullSyncBaseline) {
+        const baseStock = fullSyncBaseline.current_stock ?? fullSyncBaseline.target_stock ?? 0;
+        const appliedRecords = rawRecordsDetail.appliedRecords || [];
+        let totalChange = 0;
+        for (const record of appliedRecords) {
+            if (record.applyResult === 'success') {
+                // 注意：0 也是合法值，不能用 || 否则会被错误替换
+                totalChange += (record.changeAmount ?? record.change ?? 0);
+            }
+        }
+        const theoreticalStock = baseStock + totalChange;
+        
+        html += `
+            <div style="background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 4px; padding: 12px; margin-top: 15px;">
+                <div style="font-weight: bold;">📊 理论库存计算</div>
+                <div style="margin-top: 8px;">
+                    基准库存: ${baseStock} + 成功变化量: ${totalChange >= 0 ? '+' : ''}${totalChange} 
+                    = <strong style="color: #52c41a; font-size: 16px;">${theoreticalStock}</strong>
+                </div>
+                <div style="font-size: 12px; color: #666; margin-top: 4px;">
+                    （注: 被过滤和去重的变化量不计入）
+                </div>
             </div>
         `;
     }
     
     resultContainer.innerHTML = html;
+}
+
+// 格式化操作描述（类似饿了么后台的样式）
+function formatOpContent(opContent, oldStock, newStock) {
+    // 如果有 opContent，尝试解析
+    if (opContent) {
+        // 移除 HTML 标签但保留结构
+        let text = opContent
+            .replace(/<br\/?>/gi, '\n')
+            .replace(/<b>/gi, '')
+            .replace(/<\/b>/gi, '')
+            .replace(/&nbsp;/g, ' ');
+        
+        // 提取关键信息
+        const oldMatch = text.match(/原信息.*?库存[：:]\s*(\d+)/s);
+        const newMatch = text.match(/新信息.*?库存[：:]\s*(\d+)/s);
+        
+        const displayOld = oldMatch ? oldMatch[1] : (oldStock ?? '-');
+        const displayNew = newMatch ? newMatch[1] : (newStock ?? '-');
+        
+        return `
+            <div class="op-label">【修改门店商品】</div>
+            <div class="op-old">原信息 - 库存: ${displayOld}</div>
+            <div class="op-new">新信息 - 库存: ${displayNew}</div>
+        `;
+    }
+    
+    // 如果没有 opContent，使用 oldStock/newStock
+    return `
+        <div class="op-label">【修改门店商品】</div>
+        <div class="op-old">原信息 - 库存: ${oldStock ?? '-'}</div>
+        <div class="op-new">新信息 - 库存: ${newStock ?? '-'}</div>
+    `;
+}
+
+// 获取 Tab 标签名
+function getTabLabel(tab) {
+    const labels = {
+        'all': '全部',
+        'applied': '实际同步',
+        'filtered': '已过滤',
+        'deduplicated': '已去重'
+    };
+    return labels[tab] || tab;
 }
 
 // 导出追溯数据

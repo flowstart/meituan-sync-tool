@@ -6,6 +6,7 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const logger = require('./utils/logger');
+const fileWriteQueue = require('./utils/file-write-queue');
 const SyncDatabase = require('./database/database');
 const SyncManager = require('./core/sync-manager');
 const DualSyncManager = require('./core/dual-sync-manager');
@@ -58,6 +59,42 @@ function createWindow() {
 
   // 加载前端界面
   mainWindow.loadFile(path.join(__dirname, 'index.html'));
+
+  // renderer 健康监控：白屏/崩溃可观测 + 可选自愈
+  try {
+    let lastAutoReloadAt = 0;
+    const AUTO_RELOAD_COOLDOWN_MS = 60 * 1000;
+
+    mainWindow.webContents.on('render-process-gone', (event, details) => {
+      logger.error('渲染进程退出(render-process-gone):', details);
+      const reason = details && details.reason;
+      const now = Date.now();
+      const shouldAutoReload = reason === 'crashed' || reason === 'oom' || reason === 'killed';
+      if (shouldAutoReload && now - lastAutoReloadAt >= AUTO_RELOAD_COOLDOWN_MS) {
+        lastAutoReloadAt = now;
+        setTimeout(() => {
+          try {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              logger.warn('尝试自动重载页面以恢复白屏...');
+              mainWindow.reload();
+            }
+          } catch (e) {
+            logger.error('自动重载失败:', e);
+          }
+        }, 1000);
+      }
+    });
+
+    mainWindow.on('unresponsive', () => {
+      logger.error('窗口无响应(unresponsive)');
+    });
+
+    mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
+      logger.error('页面加载失败(did-fail-load):', { errorCode, errorDescription, validatedURL });
+    });
+  } catch (e) {
+    logger.error('注册 renderer 监控失败:', e);
+  }
 
   // 开发模式下打开DevTools
   if (process.argv.includes('--dev')) {
@@ -253,6 +290,12 @@ app.on('activate', () => {
  */
 app.on('before-quit', () => {
     logger.info('应用退出中...');
+
+    // 尽力 flush 异步文件写入队列，避免退出时丢日志/追溯
+    // 注意：Electron 的 before-quit 不适合长时间阻塞，这里只做“尽力而为”
+    try {
+        fileWriteQueue.flushAll().catch(() => {});
+    } catch (_) {}
     
     // 停止所有定时任务
     if (syncManager) {
@@ -580,7 +623,9 @@ ipcMain.handle('get-config', async () => {
             incrementalInterval: parseInt(db.getConfig('incremental_interval', '10')),
             batchConcurrency: parseInt(db.getConfig('batch_concurrency', '3')),
             debugMode: db.getConfig('debug_mode', 'false') === 'true',
-            cookiesCheckInterval: parseInt(db.getConfig('cookies_check_interval', '24'))
+            cookiesCheckInterval: parseInt(db.getConfig('cookies_check_interval', '24')),
+            dualFingerprintTimeThresholdMinutes: parseInt(db.getConfig('dual_fingerprint_time_threshold_minutes', '5')),
+            platformDedupTimeThresholdSeconds: parseInt(db.getConfig('platform_dedup_time_threshold_seconds', '10'))
         };
     } catch (error) {
         logger.error('获取全局配置失败:', error);
@@ -600,6 +645,8 @@ ipcMain.handle('save-config', async (event, config) => {
         db.setConfig('batch_concurrency', config.batchConcurrency.toString());
         db.setConfig('debug_mode', config.debugMode.toString());
         db.setConfig('cookies_check_interval', config.cookiesCheckInterval.toString());
+        db.setConfig('dual_fingerprint_time_threshold_minutes', String(config.dualFingerprintTimeThresholdMinutes ?? 5));
+        db.setConfig('platform_dedup_time_threshold_seconds', String(config.platformDedupTimeThresholdSeconds ?? 10));
         
         // 刷新所有缓存的引擎，确保使用新配置（特别是 debugMode）
         syncManager.refreshAllEngines();
@@ -990,10 +1037,34 @@ ipcMain.handle('dual-sync-select-b-qnh-store', async (event, { groupId, storeId,
 
 // ==================== 追溯查询功能 ====================
 
-// 按条形码查询追溯记录
-ipcMain.handle('dual-sync-get-trace-by-barcode', async (event, { groupId, barcode, limit = 500 }) => {
+// 按条形码查询追溯记录（增强版：包含原始记录详情）
+ipcMain.handle('dual-sync-get-trace-by-barcode', async (event, { groupId, barcode, limit = 500, includeRawRecords = true }) => {
     try {
         const result = db.getDualSyncTraceByBarcode(groupId, barcode, limit);
+        
+        // 如果需要，从 JSON 日志中读取原始记录详情
+        if (includeRawRecords) {
+            const { getTraceRecordsByBarcode } = require('./utils/trace-logger');
+            const dataDir = path.join(app.getPath('userData'), 'data');
+            
+            // 计算开始日期（用于匹配追溯日志的目录 YYYY-MM-DD，采用“本地日期”避免时区导致跨天）
+            let sinceDate = null;
+            if (result.fullSyncBaseline && typeof result.fullSyncBaseline.created_at === 'string') {
+                // created_at 形如 2026-01-17T15:52:22（无时区），直接取日期部分最稳定
+                sinceDate = result.fullSyncBaseline.created_at.slice(0, 10);
+            } else {
+                const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+                const y = thirtyDaysAgo.getFullYear();
+                const m = String(thirtyDaysAgo.getMonth() + 1).padStart(2, '0');
+                const d = String(thirtyDaysAgo.getDate()).padStart(2, '0');
+                sinceDate = `${y}-${m}-${d}`;
+            }
+            
+            // 获取 JSON 日志中的原始记录
+            const rawData = getTraceRecordsByBarcode(dataDir, groupId, barcode, sinceDate, limit);
+            result.rawRecordsDetail = rawData;
+        }
+        
         return { success: true, data: result };
     } catch (error) {
         logger.error(`查询追溯记录失败 (组${groupId}, 条形码${barcode}):`, error);

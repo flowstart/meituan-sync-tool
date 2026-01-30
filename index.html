@@ -209,6 +209,18 @@
                             <input type="number" id="cookiesCheckInterval" min="1" max="168" value="24">
                             <div class="config-hint">默认24小时。对长期未同步的组定期检查cookies有效性。</div>
                         </div>
+
+                        <div class="config-item">
+                            <label for="dualFingerprintTimeThresholdMinutes">双向同步回流过滤时间差阈值（分钟）</label>
+                            <input type="number" id="dualFingerprintTimeThresholdMinutes" min="1" max="60" value="5">
+                            <div class="config-hint">默认5分钟。仅当操作记录的时间与工具写入时间差≤该阈值时，才判定为回流并过滤。</div>
+                        </div>
+
+                        <div class="config-item">
+                            <label for="platformDedupTimeThresholdSeconds">平台订单去重时间差阈值（秒）</label>
+                            <input type="number" id="platformDedupTimeThresholdSeconds" min="1" max="120" value="10">
+                            <div class="config-hint">默认10秒。【平台】类订单在此时间差内视为重复记录；【API】类订单必须时间完全一致才视为重复。</div>
+                        </div>
                     </div>
                     
                     <!-- 失败日志查看 -->
@@ -449,7 +461,7 @@
     </dialog>
 
     <!-- 追溯查询对话框 -->
-    <dialog id="traceQueryDialog" class="dialog dialog-large">
+    <dialog id="traceQueryDialog" class="dialog dialog-xlarge">
         <div class="dialog-header">
             <h3>🔍 库存追溯查询</h3>
             <button class="dialog-close" onclick="closeTraceQueryDialog()">✕</button>
@@ -465,8 +477,30 @@
                 </div>
             </div>
 
+            <!-- 商品信息区域 -->
+            <div id="traceProductInfo" style="display: none; background: #f5f5f5; padding: 12px; border-radius: 4px; margin-bottom: 15px;">
+            </div>
+
+            <!-- Tab 切换区域 -->
+            <div id="traceTabsContainer" style="display: none; margin-bottom: 15px;">
+                <div class="trace-tabs" style="display: flex; border-bottom: 1px solid #e8e8e8;">
+                    <button class="trace-tab active" data-tab="all" onclick="switchTraceTab('all')">
+                        全部 <span id="traceTabCountAll" class="trace-tab-count">0</span>
+                    </button>
+                    <button class="trace-tab" data-tab="applied" onclick="switchTraceTab('applied')">
+                        实际同步 <span id="traceTabCountApplied" class="trace-tab-count">0</span>
+                    </button>
+                    <button class="trace-tab" data-tab="filtered" onclick="switchTraceTab('filtered')">
+                        已过滤 <span id="traceTabCountFiltered" class="trace-tab-count">0</span>
+                    </button>
+                    <button class="trace-tab" data-tab="deduplicated" onclick="switchTraceTab('deduplicated')">
+                        已去重 <span id="traceTabCountDeduplicated" class="trace-tab-count">0</span>
+                    </button>
+                </div>
+            </div>
+
             <!-- 查询结果区域 -->
-            <div id="traceQueryResult" style="max-height: 500px; overflow-y: auto;">
+            <div id="traceQueryResult" style="max-height: 450px; overflow-y: auto;">
                 <div style="text-align: center; color: #999; padding: 40px;">
                     <p>请输入条形码查询商品的同步历史</p>
                     <p style="font-size: 12px; margin-top: 8px;">将自动从最近一次全量同步开始追溯</p>

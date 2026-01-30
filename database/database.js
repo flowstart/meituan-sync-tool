@@ -1391,20 +1391,20 @@ class SyncDatabase {
     }
 
     /**
-     * 获取指定时间窗内的指纹集合（用于过滤饿了么操作记录回流）
+     * 获取指定时间窗内的指纹映射（用于过滤饿了么操作记录回流）
      * @param {number} groupId - 双向同步组ID
      * @param {string} destSide - 'A' | 'B'
      * @param {string} windowStartIso - 起始时间（toLocalISOString 格式）
      * @param {string} windowEndIso - 结束时间（toLocalISOString 格式）
-     * @returns {Set<string>} 指纹集合，形如 `${barcode}_${old}_${new}`
+     * @returns {Map<string, string[]>} 指纹映射，key 为 `${barcode}_${old}_${new}`，value 为 appliedAt 时间数组
      */
     getDualSyncAppliedFingerprints(groupId, destSide, windowStartIso, windowEndIso) {
         if (!windowStartIso || !windowEndIso) {
-            return new Set();
+            return new Map();
         }
 
         const stmt = this.db.prepare(`
-            SELECT barcode, old_stock, new_stock
+            SELECT barcode, old_stock, new_stock, applied_at
             FROM dual_sync_applied_change
             WHERE group_id = ?
               AND dest_side = ?
@@ -1416,11 +1416,15 @@ class SyncDatabase {
         `);
 
         const rows = stmt.all(groupId, destSide, windowStartIso, windowEndIso);
-        const set = new Set();
+        const map = new Map();
         for (const row of rows) {
-            set.add(`${row.barcode}_${row.old_stock}_${row.new_stock}`);
+            const key = `${row.barcode}_${row.old_stock}_${row.new_stock}`;
+            if (!map.has(key)) {
+                map.set(key, []);
+            }
+            map.get(key).push(row.applied_at);
         }
-        return set;
+        return map;
     }
 
     /**
