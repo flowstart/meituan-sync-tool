@@ -124,6 +124,67 @@ class DualSyncEngine {
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    _getRecordType(opUser) {
+        const user = opUser || '';
+        if (user.includes('【平台】')) return 'platform';
+        if (user.includes('【API】')) return 'api';
+        return 'other';
+    }
+
+    _getOpTimeMs(opTime) {
+        if (!opTime) return NaN;
+        if (opTime instanceof Date) return opTime.getTime();
+        const s = String(opTime);
+        return new Date(s.replace(/-/g, '/')).getTime();
+    }
+
+    _getLocalIsoFromOpTime(opTime) {
+        const opTimeMs = this._getOpTimeMs(opTime);
+        if (Number.isNaN(opTimeMs)) return null;
+        return toLocalISOString(new Date(opTimeMs));
+    }
+
+    _buildSourceEventKey(side, rawRecord, recordType = null) {
+        const type = recordType || this._getRecordType(rawRecord.opUser);
+        const bizId = rawRecord.bizId || '-';
+        const eleBizId = rawRecord.eleBizId || '-';
+        const oldStock = rawRecord.oldStock ?? 'null';
+        const newStock = rawRecord.newStock ?? 'null';
+
+        // 只要上游给了业务 ID，就优先按业务 ID 归并；
+        // 这样同一笔平台订单在相邻秒重复返回时，跨轮次也不会被二次消费。
+        if (bizId !== '-' || eleBizId !== '-') {
+            return `${side}|${type}|${rawRecord.barcode}|${bizId}|${eleBizId}|${oldStock}|${newStock}`;
+        }
+
+        const opTimeMs = this._getOpTimeMs(rawRecord.opTime);
+        const timePart = Number.isNaN(opTimeMs) ? String(rawRecord.opTime || '') : String(opTimeMs);
+        return `${side}|${type}|${rawRecord.barcode}|${oldStock}|${newStock}|${timePart}`;
+    }
+
+    _createBaselineStockMap(products) {
+        const baselineStock = {};
+        for (const product of products || []) {
+            if (!product || !product.barcode) continue;
+            baselineStock[product.barcode] = {
+                stock: typeof product.stock === 'number' ? product.stock : parseInt(product.stock, 10) || 0,
+                name: product.name || null
+            };
+        }
+        return baselineStock;
+    }
+
+    _applyChangeMapToBaseline(baselineStock, changes, productNameMap = {}) {
+        if (!changes) return;
+        for (const [barcode, change] of Object.entries(changes)) {
+            const current = baselineStock[barcode]?.stock ?? 0;
+            baselineStock[barcode] = {
+                stock: Math.max(0, current + (change.totalChange || 0)),
+                name: baselineStock[barcode]?.name || productNameMap[barcode] || null
+            };
+        }
+    }
+
     /**
      * 全量同步
      * 以A饿了么的库存为基准，同步到B牵牛花
@@ -131,6 +192,7 @@ class DualSyncEngine {
     async fullSync() {
         this._cancelled = false;
         const startTime = new Date();
+        let fullSyncHistoryId = null;
         
         try {
             this._log('info', '==================== 开始双向全量同步 ====================');
@@ -138,6 +200,7 @@ class DualSyncEngine {
             
             // 初始化失败记录
             const failedRecords = [];
+            fullSyncHistoryId = this.db.addDualSyncHistory(this.groupId, 'full', startTime, 'running');
 
             // 步骤1: 从A饿了么导出商品
             this._log('info', '步骤1: 从A饿了么导出商品...');
@@ -150,10 +213,14 @@ class DualSyncEngine {
             }
             
             const exportPath = path.join(dataDir, `dual_${this.groupId}_elemeA_${Date.now()}.xlsx`);
-            await this.elemeA.exportProducts(exportPath, {
+            const exportResult = await this.elemeA.exportProducts(exportPath, {
                 shouldCancel: () => this._cancelled,
                 log: (level, msg) => this._log(level, `[A饿了么导出] ${msg}`)
             });
+
+            if (!exportResult) {
+                throw new Error('A饿了么导出失败');
+            }
             
             // 记录导出结束时间（作为后续增量同步的起点）
             // 这个时间点之后的销售变化才需要通过增量同步处理
@@ -173,6 +240,13 @@ class DualSyncEngine {
                 throw new Error('A饿了么未导出任何商品');
             }
 
+            const baselineStock = this._createBaselineStockMap(elemeProducts);
+            const productNameMap = Object.fromEntries(
+                elemeProducts
+                    .filter(product => product && product.barcode)
+                    .map(product => [product.barcode, product.name || null])
+            );
+
             this._checkCancelled();
 
             // 步骤3: 获取B牵牛花SKU映射
@@ -184,24 +258,23 @@ class DualSyncEngine {
             
             this._checkCancelled();
 
-            // 【已优化】步骤3.1: 获取B牵牛花当前库存
-            // 全量同步是覆盖式同步，不需要计算变化量。
-            // 失败时只需记录目标库存(targetStock)即可，无需当前库存(currentStock)。
-            // 之前此步骤耗时较长（9000+商品需5分钟），现已移除以提升性能。
-            // 如需调试查看变化量，可临时恢复以下代码：
-            // this._log('info', '步骤3.1: 获取B牵牛花当前库存...');
-            // this._progress(55, '查询B牵牛花库存...');
-            // const mappedBarcodes = barcodes.filter(b => qnhBMapping[b]);
-            // const bStockData = mappedBarcodes.length > 0
-            //     ? await this.qnhB.getStockByBarcodes(this.qnhBStoreId, mappedBarcodes)
-            //     : {};
+            // 步骤3.1: 获取B牵牛花当前库存
+            // 这里需要保留旧库存值，用于：
+            // 1. 生成全量同步的 applied fingerprints，过滤下一轮饿了么 API 回流
+            // 2. 在追溯中准确记录全量前后的库存变化
+            this._log('info', '步骤3.1: 获取B牵牛花当前库存...');
+            this._progress(55, '查询B牵牛花库存...');
+            const mappedBarcodes = barcodes.filter(b => qnhBMapping[b]);
+            const bStockData = mappedBarcodes.length > 0
+                ? await this.qnhB.getStockByBarcodes(this.qnhBStoreId, mappedBarcodes)
+                : {};
 
             // 步骤4: 准备更新数据
             this._log('info', '步骤4: 准备更新数据...');
             this._progress(60, '准备更新数据...');
             
             const updatesB = [];
-            const updateDetailsB = []; // 保存更新详情（全量同步不含当前库存/变化量），用于调试/失败记录
+            const updateDetailsB = []; // 保存更新详情，用于追溯、失败记录和回流指纹
 
             for (const product of elemeProducts) {
                 const barcode = product.barcode;
@@ -236,9 +309,10 @@ class DualSyncEngine {
                     continue;
                 }
 
-                // 【已优化】不再查询B当前库存，全量同步直接覆盖
-                // 原逻辑：const targetInfo = bStockData[barcode]; 判断商品是否存在
-                // 现在：只要有SKU映射就直接更新，更新失败会在批量更新阶段捕获
+                const targetInfo = bStockData[barcode];
+                const currentStock = targetInfo && typeof targetInfo.stock === 'number'
+                    ? targetInfo.stock
+                    : null;
                 const targetStock = stock;
 
                 updatesB.push({
@@ -250,7 +324,7 @@ class DualSyncEngine {
                     barcode,
                     name,
                     skuId: skuIdB,
-                    currentStock: null,  // 全量同步不查询当前库存
+                    currentStock,
                     targetStock,
                     changeAmount: null   // 全量同步不计算变化量
                 });
@@ -319,7 +393,10 @@ class DualSyncEngine {
                                         successSnapshotsB.push({
                                             barcode: detail.barcode,
                                             stock: detail.targetStock,
-                                            productName: detail.name || null
+                                            oldStock: detail.currentStock,
+                                            newStock: detail.targetStock,
+                                            productName: detail.name || null,
+                                            appliedAt: toLocalISOString(new Date())
                                         });
                                     }
                                 }
@@ -384,75 +461,148 @@ class DualSyncEngine {
                 }
             }
 
-            // 步骤6: 记录同步时间
+            // 步骤6: 收敛“导出后到全量完成前”的 A 侧真实变化，形成共同基线
+            let commonBaselineTime = exportEndTime;
+            let settleRounds = 0;
+            let settleSuccess = 0;
+            let settleFailed = 0;
+            const MAX_SETTLE_ROUNDS = 3;
+            let settleCursorSeconds = Math.floor(exportEndTime.getTime() / 1000);
+
+            let settleStoppedByMaxRounds = false;
+            if (!this.debugMode) {
+                while (settleRounds < MAX_SETTLE_ROUNDS) {
+                    settleRounds++;
+                    const settleQueryEndSeconds = Math.floor(Date.now() / 1000);
+                    commonBaselineTime = new Date(settleQueryEndSeconds * 1000);
+
+                    if (settleQueryEndSeconds <= settleCursorSeconds) {
+                        break;
+                    }
+
+                    this._log('info', `步骤6.${settleRounds}: 收敛导出后A侧变化...`);
+                    const settleQueryResult = await this._queryChanges(
+                        this.elemeA,
+                        settleCursorSeconds,
+                        settleQueryEndSeconds,
+                        'A',
+                        { excludeFingerprintMap: null, consumedEventKeySet: null }
+                    );
+                    const settleChanges = settleQueryResult.changes || {};
+
+                    if (Object.keys(settleChanges).length === 0) {
+                        this._log('info', `步骤6.${settleRounds}: 未检测到新的A侧变化，共同基线确认到 ${toLocalISOString(commonBaselineTime)}`);
+                        settleCursorSeconds = settleQueryEndSeconds;
+                        break;
+                    }
+
+                    this._log('info', `步骤6.${settleRounds}: 检测到 ${Object.keys(settleChanges).length} 个商品在导出后发生变化，继续同步到B...`);
+                    const settleResult = await this._applyChanges(
+                        settleChanges,
+                        this.qnhB,
+                        this.qnhBStoreId,
+                        `全量收敛A→B(第${settleRounds}轮)`,
+                        {
+                            syncRunId: fullSyncHistoryId,
+                            destSide: 'B',
+                            directionCode: 'A->B',
+                            sourceSide: 'A',
+                            markSourceConsumed: false
+                        }
+                    );
+
+                    settleSuccess += settleResult.success || 0;
+                    settleFailed += settleResult.failed || 0;
+                    failedRecords.push(...(settleResult.failedRecords || []));
+
+                    for (const success of (settleResult.successRecords || [])) {
+                        if (!baselineStock[success.barcode]) {
+                            baselineStock[success.barcode] = {
+                                stock: success.targetStock,
+                                name: productNameMap[success.barcode] || null
+                            };
+                        } else {
+                            baselineStock[success.barcode].stock = success.targetStock;
+                        }
+                    }
+
+                    settleCursorSeconds = settleQueryEndSeconds;
+                }
+
+                if (settleRounds >= MAX_SETTLE_ROUNDS && settleCursorSeconds < Math.floor(Date.now() / 1000)) {
+                    settleStoppedByMaxRounds = true;
+                    this._log('warn', `全量收敛达到最大轮数(${MAX_SETTLE_ROUNDS})，共同基线暂定为 ${toLocalISOString(commonBaselineTime)}`);
+                }
+            }
+
+            // 步骤7: 记录同步时间与共同基线
             const now = new Date();
+            const commonBaselineIso = toLocalISOString(commonBaselineTime);
             this.db.updateDualSyncGroup(this.groupId, {
                 last_full_sync_time: toLocalISOString(now),
-                // 使用导出结束时间作为增量同步的起点
-                // 导出数据是在这个时间点的快照，之后的销售变化需要通过增量同步处理
-                last_a_query_time: toLocalISOString(exportEndTime),
-                // B侧基线使用“全量同步完成时间”，避免下一次增量查询到全量同步引发的 API 回流记录
-                last_b_query_time: toLocalISOString(now)
+                last_full_sync_count: Object.keys(baselineStock).length,
+                last_a_query_time: commonBaselineIso,
+                last_b_query_time: commonBaselineIso,
+                full_sync_a_baseline_time: commonBaselineIso,
+                full_sync_b_baseline_time: commonBaselineIso
             });
 
             const duration = ((now - startTime) / 1000).toFixed(1);
+            const totalFullSuccess = successB + settleSuccess;
             this._progress(100, this.debugMode ? '调试模式：全量同步完成（未执行实际更新）' : '全量同步完成');
             this._log('info', '==================== 全量同步完成(A→B) ====================');
             this._log('info', `耗时: ${duration}秒`);
-            this._log('info', `B牵牛花更新: ${successB}/${updatesB.length}`);
+            this._log('info', `共同基线时间: ${commonBaselineIso}`);
+            this._log('info', `初始全量写入: ${successB}/${updatesB.length}`);
+            if (settleRounds > 0) {
+                this._log('info', `全量收敛: 成功${settleSuccess}个, 失败${settleFailed}个, 轮数${settleRounds}`);
+            }
             if (this.debugMode) {
                 this._log('warn', '⚠️ 调试模式：未执行实际库存更新');
             }
-            
-            // 如果有失败记录，导出到文件
+
             if (failedRecords.length > 0) {
                 this._log('warn', `有 ${failedRecords.length} 个商品更新失败`);
                 this._exportFailedRecords(failedRecords);
             }
 
-            // 成功后写入库存快照（仅非调试模式）
             if (!this.debugMode && successSnapshotsB.length > 0) {
                 this.db.saveDualSyncStockSnapshotBatch(this.groupId, successSnapshotsB);
                 this._log('info', `已写入库存快照: ${successSnapshotsB.length} 条`);
             }
 
-            // 写入追溯记录（全量同步基准）
             try {
-                // 创建一个临时的 historyId 用于追溯（全量同步也需要记录到 dual_sync_history）
-                const fullSyncHistoryId = this.db.addDualSyncHistory(this.groupId, 'full', startTime, 'success');
-                if (fullSyncHistoryId) {
-                    this.db.updateDualSyncHistory(fullSyncHistoryId, {
-                        endTime: now,
-                        status: failedRecords.length === 0 ? 'success' : 'partial',
-                        totalItems: updatesB.length + failedRecords.length,
-                        successItems: successB,
-                        failedItems: failedRecords.length
-                    });
-                }
+                this.db.updateDualSyncHistory(fullSyncHistoryId, {
+                    endTime: now,
+                    status: failedRecords.length === 0 ? 'success' : 'partial',
+                    totalItems: totalFullSuccess + failedRecords.length,
+                    successItems: totalFullSuccess,
+                    failedItems: failedRecords.length
+                });
 
-                // 准备追溯记录：成功的商品
+                const successBarcodeSet = new Set(successSnapshotsB.map(s => s.barcode));
+                const failedBarcodeSet = new Set((failedRecords || []).map(item => item.barcode).filter(Boolean));
                 const traceRecords = [];
                 for (const detail of updateDetailsB) {
-                    const isSuccess = successSnapshotsB.some(s => s.barcode === detail.barcode);
+                    const finalBaselineStock = baselineStock[detail.barcode]?.stock ?? detail.targetStock;
+                    const isSuccess = successBarcodeSet.has(detail.barcode) && !failedBarcodeSet.has(detail.barcode);
                     traceRecords.push({
                         direction: 'A->B',
                         barcode: detail.barcode,
                         productName: detail.name,
                         sourceRecordsCount: 1,
-                        sourceTotalChange: null, // 全量同步不计算变化量
+                        sourceTotalChange: null,
                         wasFiltered: false,
                         wasDeduplicated: false,
                         filterReason: null,
-                        currentStock: detail.targetStock, // 全量同步时 A饿了么库存作为基准
-                        targetStock: detail.targetStock,
+                        currentStock: finalBaselineStock,
+                        targetStock: finalBaselineStock,
                         applyResult: isSuccess ? 'success' : 'failed',
                         errorMsg: isSuccess ? null : '批量更新失败'
                     });
                 }
 
-                // 准备追溯记录：失败的商品（未找到SKU映射）
                 for (const failed of failedRecords) {
-                    // 检查是否已在 updateDetailsB 中
                     if (!updateDetailsB.some(d => d.barcode === failed.barcode)) {
                         traceRecords.push({
                             direction: 'A->B',
@@ -471,20 +621,29 @@ class DualSyncEngine {
                     }
                 }
 
-                // 写入追溯记录到数据库
-                if (traceRecords.length > 0 && fullSyncHistoryId) {
+                if (traceRecords.length > 0) {
                     this.db.addDualSyncTraceBatch(this.groupId, fullSyncHistoryId, 'full', traceRecords);
                     this._log('info', `已写入追溯记录: ${traceRecords.length} 条`);
                 }
 
-                // 写入 JSON 详细日志
-                const baselineStock = {};
-                for (const product of elemeProducts) {
-                    if (product.barcode) {
-                        baselineStock[product.barcode] = {
-                            stock: product.stock,
-                            name: product.name || null
-                        };
+                if (!this.debugMode && successSnapshotsB.length > 0) {
+                    const fingerprintItems = successSnapshotsB
+                        .filter(s => s && s.barcode && typeof s.oldStock === 'number' && typeof s.newStock === 'number')
+                        .map(s => ({
+                            barcode: s.barcode,
+                            oldStock: s.oldStock,
+                            newStock: s.newStock,
+                            appliedAt: s.appliedAt
+                        }));
+                    if (fingerprintItems.length > 0) {
+                        this.db.addDualSyncAppliedChanges(
+                            this.groupId,
+                            fullSyncHistoryId,
+                            'B',
+                            'A->B',
+                            fingerprintItems
+                        );
+                        this._log('info', `已写入全量回流指纹: ${fingerprintItems.length} 条`);
                     }
                 }
 
@@ -494,12 +653,20 @@ class DualSyncEngine {
                     groupId: this.groupId,
                     startTime: toLocalISOString(startTime),
                     endTime: toLocalISOString(now),
+                    commonBaselineTime: commonBaselineIso,
+                    fullCompletedAt: toLocalISOString(now),
+                    settleSummary: {
+                        rounds: settleRounds,
+                        success: settleSuccess,
+                        failed: settleFailed,
+                        stoppedByMaxRounds: settleStoppedByMaxRounds
+                    },
                     baselineStock,
                     appliedChanges: {
-                        success: successSnapshotsB.map(s => ({
-                            barcode: s.barcode,
-                            stock: s.stock,
-                            productName: s.productName
+                        success: Object.entries(baselineStock).map(([barcode, info]) => ({
+                            barcode,
+                            stock: info.stock,
+                            productName: info.name
                         })),
                         failed: failedRecords.map(f => ({
                             barcode: f.barcode,
@@ -515,18 +682,29 @@ class DualSyncEngine {
             }
 
             return {
-                status: 'success',
+                status: failedRecords.length === 0 ? 'success' : 'partial',
                 duration: parseFloat(duration),
-                updatesB: successB,
-                failedCount: failedRecords.length
+                updatesB: totalFullSuccess,
+                failedCount: failedRecords.length,
+                commonBaselineTime: commonBaselineIso
             };
 
         } catch (error) {
             if (error.code === 'SYNC_CANCELLED') {
                 this._log('warn', '全量同步已取消');
+                try {
+                    if (fullSyncHistoryId) {
+                        this.db.updateDualSyncHistory(fullSyncHistoryId, { endTime: new Date(), status: 'cancelled', errorMsg: 'SYNC_CANCELLED' });
+                    }
+                } catch (_) {}
                 return { status: 'cancelled' };
             }
             this._log('error', `全量同步失败: ${error.message}`);
+            try {
+                if (fullSyncHistoryId) {
+                    this.db.updateDualSyncHistory(fullSyncHistoryId, { endTime: new Date(), status: 'failed', errorMsg: error.message });
+                }
+            } catch (_) {}
             return { status: 'failed', error: error.message };
         }
     }
@@ -572,7 +750,11 @@ class DualSyncEngine {
                             const obj = {};
                             for (const r of rows || []) {
                                 if (!r || !r.barcode) continue;
-                                obj[r.barcode] = { totalChange: Number(r.delta) || 0 };
+                                obj[r.barcode] = {
+                                    totalChange: Number(r.delta) || 0,
+                                    sourceEvents: Array.isArray(r.sourceEvents) ? r.sourceEvents : [],
+                                    recordsCount: Array.isArray(r.sourceEvents) && r.sourceEvents.length > 0 ? r.sourceEvents.length : 1
+                                };
                             }
                             return obj;
                         };
@@ -601,7 +783,7 @@ class DualSyncEngine {
                                 this.qnhB,
                                 this.qnhBStoreId,
                                 '恢复A饿了么→B',
-                                { syncRunId: pendingRunId, destSide: 'B', directionCode: 'A->B' }
+                                { syncRunId: pendingRunId, destSide: 'B', directionCode: 'A->B', sourceSide: 'A' }
                             );
                             totalSuccess += r.success || 0;
                             totalFailed += r.failed || 0;
@@ -626,7 +808,7 @@ class DualSyncEngine {
                                 this.qnhA,
                                 this.qnhAStoreId,
                                 '恢复B饿了么→A',
-                                { syncRunId: pendingRunId, destSide: 'A', directionCode: 'B->A' }
+                                { syncRunId: pendingRunId, destSide: 'A', directionCode: 'B->A', sourceSide: 'B' }
                             );
                             totalSuccess += r.success || 0;
                             totalFailed += r.failed || 0;
@@ -690,26 +872,57 @@ class DualSyncEngine {
 
             const lastAQueryTime = group.last_a_query_time;
             const lastBQueryTime = group.last_b_query_time;
-            const lastAApplyStartTime = group.last_a_apply_start_time;
-            const lastAApplyEndTime = group.last_a_apply_end_time;
-            const lastBApplyStartTime = group.last_b_apply_start_time;
-            const lastBApplyEndTime = group.last_b_apply_end_time;
 
             if (!lastAQueryTime || !lastBQueryTime) {
                 this._log('warn', '未检测到历史基线，请先执行全量同步');
                 throw new Error('require_full_sync_first');
             }
 
-            const aStartTime = Math.floor(new Date(lastAQueryTime).getTime() / 1000);
-            const bStartTime = Math.floor(new Date(lastBQueryTime).getTime() / 1000);
+            // 读取回溯配置（分钟）
+            let lookbackMinutes = 30;
+            try {
+                const raw = this.db.getConfig('incremental_lookback_minutes', '30');
+                const n = parseInt(raw, 10);
+                if (Number.isFinite(n) && n >= 0) {
+                    lookbackMinutes = Math.min(60, n); // 最大60分钟
+                }
+            } catch (_) {}
+            const lookbackSeconds = lookbackMinutes * 60;
+
+            // 获取全量同步基线时间（回溯边界保护）
+            const aBaselineTime = group.full_sync_a_baseline_time;
+            const bBaselineTime = group.full_sync_b_baseline_time;
+
+            // 计算回溯后的起始时间，但不能超过全量同步基线
             const now = Math.floor(Date.now() / 1000);
+            
+            // A侧：回溯但不超过基线
+            const aStartTimeRaw = Math.floor(new Date(lastAQueryTime).getTime() / 1000) - lookbackSeconds;
+            const aBaselineTimestamp = aBaselineTime ? Math.floor(new Date(aBaselineTime).getTime() / 1000) : 0;
+            const aStartTime = Math.max(aStartTimeRaw, aBaselineTimestamp);
+            
+            // B侧：回溯但不超过基线
+            const bStartTimeRaw = Math.floor(new Date(lastBQueryTime).getTime() / 1000) - lookbackSeconds;
+            const bBaselineTimestamp = bBaselineTime ? Math.floor(new Date(bBaselineTime).getTime() / 1000) : 0;
+            const bStartTime = Math.max(bStartTimeRaw, bBaselineTimestamp);
+
+            // 打印回溯信息
+            if (lookbackMinutes > 0) {
+                this._log('info', `增量回溯: ${lookbackMinutes}分钟`);
+                if (aStartTime > aStartTimeRaw) {
+                    this._log('info', `A侧回溯受基线限制，使用基线时间`);
+                }
+                if (bStartTime > bStartTimeRaw) {
+                    this._log('info', `B侧回溯受基线限制，使用基线时间`);
+                }
+            }
 
             // 记录本轮查询窗口到历史（用于取消后恢复并最终推进 query_time）
             try {
                 this.db.updateDualSyncHistory(historyId, {
-                    aQueryStartTime: lastAQueryTime,
+                    aQueryStartTime: toLocalISOString(new Date(aStartTime * 1000)),
                     aQueryEndTime: toLocalISOString(new Date(now * 1000)),
-                    bQueryStartTime: lastBQueryTime,
+                    bQueryStartTime: toLocalISOString(new Date(bStartTime * 1000)),
                     bQueryEndTime: toLocalISOString(new Date(now * 1000))
                 });
             } catch (_) {}
@@ -728,17 +941,18 @@ class DualSyncEngine {
 
             this._checkCancelled();
 
-            // 计算“工具写入窗口”对应的指纹过滤集合（用于过滤回流的【API】【子门店】）
+            // 基于“本轮实际查询窗口”构造指纹集合，避免旧回流仍在回溯窗内时被重复消费
             const TOOL_DELAY_MS = 30 * 60 * 1000; // 你观测的最大落地延迟：<=30分钟
             const TOOL_PAD_BEFORE_MS = 5 * 60 * 1000;
-            const buildFingerprintMap = (destSide, applyStartIso, applyEndIso) => {
+            const buildFingerprintMap = (destSide, queryStartTime, queryEndTime) => {
                 try {
-                    if (!applyStartIso || !applyEndIso) return null;
-                    const s = new Date(applyStartIso);
-                    const e = new Date(applyEndIso);
-                    if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return null;
-                    const windowStart = toLocalISOString(new Date(s.getTime() - TOOL_PAD_BEFORE_MS));
-                    const windowEnd = toLocalISOString(new Date(e.getTime() + TOOL_DELAY_MS));
+                    if (!Number.isFinite(queryStartTime) || !Number.isFinite(queryEndTime)) return null;
+                    const windowStart = toLocalISOString(
+                        new Date((queryStartTime * 1000) - TOOL_DELAY_MS - TOOL_PAD_BEFORE_MS)
+                    );
+                    const windowEnd = toLocalISOString(
+                        new Date((queryEndTime * 1000) + TOOL_DELAY_MS)
+                    );
                     const map = this.db.getDualSyncAppliedFingerprints(this.groupId, destSide, windowStart, windowEnd);
                     this._log('info', `[指纹过滤] destSide=${destSide}, window=${windowStart}~${windowEnd}, 指纹数=${map.size}`);
                     return map;
@@ -748,9 +962,22 @@ class DualSyncEngine {
             };
 
             // 查询 A 侧饿了么时，需要过滤“上一轮 B→A 写入”回流（destSide=A）
-            const aFingerprintMap = buildFingerprintMap('A', lastAApplyStartTime, lastAApplyEndTime);
+            const aFingerprintMap = buildFingerprintMap('A', aStartTime, now);
             // 查询 B 侧饿了么时，需要过滤“上一轮 A→B 写入”回流（destSide=B）
-            const bFingerprintMap = buildFingerprintMap('B', lastBApplyStartTime, lastBApplyEndTime);
+            const bFingerprintMap = buildFingerprintMap('B', bStartTime, now);
+            const buildConsumedEventKeySet = (sourceSide, queryStartTime, queryEndTime) => {
+                try {
+                    const windowStart = toLocalISOString(new Date(queryStartTime * 1000));
+                    const windowEnd = toLocalISOString(new Date(queryEndTime * 1000));
+                    const set = this.db.getDualSyncConsumedEventKeys(this.groupId, sourceSide, windowStart, windowEnd);
+                    this._log('info', `[已消费过滤] sourceSide=${sourceSide}, window=${windowStart}~${windowEnd}, 事件数=${set.size}`);
+                    return set;
+                } catch (e) {
+                    return new Set();
+                }
+            };
+            const aConsumedEventKeySet = buildConsumedEventKeySet('A', aStartTime, now);
+            const bConsumedEventKeySet = buildConsumedEventKeySet('B', bStartTime, now);
 
             // 打印查询时间范围（方便核对）
             this._log('info', `查询时间范围: ${toLocalISOString(new Date(aStartTime * 1000))} ~ ${toLocalISOString(new Date(now * 1000))}`);
@@ -760,7 +987,10 @@ class DualSyncEngine {
             this._log('info', '步骤1: 查询A饿了么操作记录...');
             this._progress(10, '查询A饿了么变化...');
             
-            const aQueryResult = await this._queryChanges(this.elemeA, aStartTime, now, 'A', { excludeFingerprintMap: aFingerprintMap });
+            const aQueryResult = await this._queryChanges(this.elemeA, aStartTime, now, 'A', {
+                excludeFingerprintMap: aFingerprintMap,
+                consumedEventKeySet: aConsumedEventKeySet
+            });
             const aElemeChanges = aQueryResult.changes;
             const aTraceData = aQueryResult.traceData;
             this._log('info', `A饿了么提取到 ${Object.keys(aElemeChanges).length} 个商品变化`);
@@ -771,7 +1001,10 @@ class DualSyncEngine {
             this._log('info', '步骤2: 查询B饿了么操作记录...');
             this._progress(20, '查询B饿了么变化...');
             
-            const bQueryResult = await this._queryChanges(this.elemeB, bStartTime, now, 'B', { excludeFingerprintMap: bFingerprintMap });
+            const bQueryResult = await this._queryChanges(this.elemeB, bStartTime, now, 'B', {
+                excludeFingerprintMap: bFingerprintMap,
+                consumedEventKeySet: bConsumedEventKeySet
+            });
             const bChanges = bQueryResult.changes;
             const bTraceData = bQueryResult.traceData;
             this._log('info', `B饿了么提取到 ${Object.keys(bChanges).length} 个商品变化`);
@@ -828,7 +1061,11 @@ class DualSyncEngine {
 
                 // 断点：在写入前落库 pending（仅非调试模式）
                 if (!this.debugMode) {
-                    const items = Object.entries(aElemeChanges).map(([barcode, ch]) => ({ barcode, delta: ch.totalChange || 0 }));
+                    const items = Object.entries(aElemeChanges).map(([barcode, ch]) => ({
+                        barcode,
+                        delta: ch.totalChange || 0,
+                        sourceEvents: ch.sourceEvents || []
+                    }));
                     this.db.addDualSyncPendingChanges(this.groupId, historyId, 'A->B', 'B', items);
                 }
                 
@@ -847,7 +1084,8 @@ class DualSyncEngine {
                     {
                         syncRunId: historyId,
                         destSide: 'B',
-                        directionCode: 'A->B'
+                        directionCode: 'A->B',
+                        sourceSide: 'A'
                     }
                 );
                 aElemeSuccess = aApplyResult.success;
@@ -870,7 +1108,11 @@ class DualSyncEngine {
 
                 // 断点：在写入前落库 pending（仅非调试模式）
                 if (!this.debugMode) {
-                    const items = Object.entries(bChanges).map(([barcode, ch]) => ({ barcode, delta: ch.totalChange || 0 }));
+                    const items = Object.entries(bChanges).map(([barcode, ch]) => ({
+                        barcode,
+                        delta: ch.totalChange || 0,
+                        sourceEvents: ch.sourceEvents || []
+                    }));
                     this.db.addDualSyncPendingChanges(this.groupId, historyId, 'B->A', 'A', items);
                 }
                 
@@ -889,7 +1131,8 @@ class DualSyncEngine {
                     {
                         syncRunId: historyId,
                         destSide: 'A',
-                        directionCode: 'B->A'
+                        directionCode: 'B->A',
+                        sourceSide: 'B'
                     }
                 );
                 bSuccess = bApplyResult.success;
@@ -947,6 +1190,22 @@ class DualSyncEngine {
                 if (aTraceData) {
                     // 被指纹过滤的记录
                     for (const filtered of aTraceData.filteredByFingerprint) {
+                        traceRecords.push({
+                            direction: 'A->B',
+                            barcode: filtered.barcode,
+                            productName: null,
+                            sourceRecordsCount: 1,
+                            sourceTotalChange: filtered.change,
+                            wasFiltered: true,
+                            wasDeduplicated: false,
+                            filterReason: filtered.filterReason,
+                            currentStock: filtered.oldStock,
+                            targetStock: filtered.newStock,
+                            applyResult: 'filtered',
+                            errorMsg: null
+                        });
+                    }
+                    for (const filtered of aTraceData.filteredByConsumed) {
                         traceRecords.push({
                             direction: 'A->B',
                             barcode: filtered.barcode,
@@ -1020,6 +1279,22 @@ class DualSyncEngine {
                 // 处理 B→A 方向的追溯记录
                 if (bTraceData) {
                     for (const filtered of bTraceData.filteredByFingerprint) {
+                        traceRecords.push({
+                            direction: 'B->A',
+                            barcode: filtered.barcode,
+                            productName: null,
+                            sourceRecordsCount: 1,
+                            sourceTotalChange: filtered.change,
+                            wasFiltered: true,
+                            wasDeduplicated: false,
+                            filterReason: filtered.filterReason,
+                            currentStock: filtered.oldStock,
+                            targetStock: filtered.newStock,
+                            applyResult: 'filtered',
+                            errorMsg: null
+                        });
+                    }
+                    for (const filtered of bTraceData.filteredByConsumed) {
                         traceRecords.push({
                             direction: 'B->A',
                             barcode: filtered.barcode,
@@ -1114,6 +1389,10 @@ class DualSyncEngine {
                         byFingerprint: [
                             ...(aTraceData ? aTraceData.filteredByFingerprint.map(r => ({ ...r, side: 'A' })) : []),
                             ...(bTraceData ? bTraceData.filteredByFingerprint.map(r => ({ ...r, side: 'B' })) : [])
+                        ],
+                        byConsumed: [
+                            ...(aTraceData ? aTraceData.filteredByConsumed.map(r => ({ ...r, side: 'A' })) : []),
+                            ...(bTraceData ? bTraceData.filteredByConsumed.map(r => ({ ...r, side: 'B' })) : [])
                         ],
                         byDeduplication: [
                             ...(aTraceData ? aTraceData.filteredByDedup.map(r => ({ ...r, side: 'A' })) : []),
@@ -1239,6 +1518,7 @@ class DualSyncEngine {
         const traceData = {
             rawRecords: [],           // 原始记录（简化版，用于追溯）
             filteredByFingerprint: [], // 被指纹过滤的记录
+            filteredByConsumed: [],   // 被历史已消费账本过滤的记录
             filteredByDedup: []        // 被去重的记录
         };
 
@@ -1252,8 +1532,10 @@ class DualSyncEngine {
         let duplicateCount = 0;
         let multiSpecCount = 0;
         let filteredByFingerprint = 0;
+        let filteredByConsumed = 0;
         let fingerprintTimeSkipped = 0; // 指纹命中但时间差超过阈值，视为真实变更
         const excludeFingerprintMap = options && options.excludeFingerprintMap instanceof Map ? options.excludeFingerprintMap : null;
+        const consumedEventKeySet = options && options.consumedEventKeySet instanceof Set ? options.consumedEventKeySet : null;
         // 从全局配置读取阈值（分钟），默认 5 分钟
         let fingerprintThresholdMinutes = 5;
         try {
@@ -1279,14 +1561,6 @@ class DualSyncEngine {
         // 兜底保护：限制在 1~120 秒
         platformDedupThresholdSeconds = Math.max(1, Math.min(120, platformDedupThresholdSeconds));
         const PLATFORM_DEDUP_THRESHOLD_MS = platformDedupThresholdSeconds * 1000;
-
-        // 判断记录类型的辅助函数
-        const getRecordType = (opUser) => {
-            const user = opUser || '';
-            if (user.includes('【平台】')) return 'platform';
-            if (user.includes('【API】')) return 'api';
-            return 'other';
-        };
 
         // 检查是否重复的辅助函数
         const checkDuplicate = (dedupeKey, opTimeMs, recordType) => {
@@ -1329,16 +1603,19 @@ class DualSyncEngine {
             }
         };
 
-        const getOpTimeMs = (opTime) => {
-            // ElemeParser.parseOperationLog 会把 op_time 解析成 Date；这里做兼容
-            if (!opTime) return NaN;
-            if (opTime instanceof Date) return opTime.getTime();
-            // 兜底：字符串/数字都转字符串尝试解析
-            const s = String(opTime);
-            // Safari 对 `YYYY-MM-DD HH:mm:ss` 兼容差，做 replace
-            return new Date(s.replace(/-/g, '/')).getTime();
+        const ensureChangeBucket = (barcode) => {
+            if (!changes[barcode]) {
+                changes[barcode] = { totalChange: 0, recordsCount: 0, sourceEvents: [] };
+            }
+            return changes[barcode];
         };
-        
+
+        const appendSourceEvent = (bucket, event) => {
+            if (!event || !event.eventKey) return;
+            if (bucket.sourceEvents.some(item => item.eventKey === event.eventKey)) return;
+            bucket.sourceEvents.push(event);
+        };
+
         for (const log of candidateLogs) {
             // 多规格商品处理
             if (log.is_multi_spec && log.stock_changes_by_barcode) {
@@ -1360,6 +1637,7 @@ class DualSyncEngine {
                         newStock: stockChange.new_stock,
                         change: stockChange.change,
                         opTime: log.op_time,
+                        opTimeIso: this._getLocalIsoFromOpTime(log.op_time),
                         opUser: log.op_user,
                         opContent: log.op_content,   // 保存原始内容便于追溯
                         isMultiSpec: true
@@ -1369,7 +1647,7 @@ class DualSyncEngine {
                     // 工具回流过滤：命中指纹且时间差在阈值内才跳过
                     if (excludeFingerprintMap && excludeFingerprintMap.has(dedupeKey)) {
                         const appliedAtList = excludeFingerprintMap.get(dedupeKey);
-                        const opTimeMs = getOpTimeMs(log.op_time);
+                        const opTimeMs = this._getOpTimeMs(log.op_time);
                         // 检查是否有任意一个 appliedAt 与 opTime 时间差在阈值内
                         const isWithinThreshold = appliedAtList.some(appliedAt => {
                             const appliedAtMs = new Date(appliedAt).getTime();
@@ -1389,10 +1667,19 @@ class DualSyncEngine {
                             fingerprintTimeSkipped++;
                         }
                     }
-                    
-                    // 去重判断：根据 opUser 类型区分
-                    const opTimeMs = getOpTimeMs(log.op_time);
-                    const recordType = getRecordType(log.op_user);
+
+                    const opTimeMs = this._getOpTimeMs(log.op_time);
+                    const recordType = this._getRecordType(log.op_user);
+                    const eventKey = this._buildSourceEventKey(side, rawRecord, recordType);
+                    if (consumedEventKeySet && consumedEventKeySet.has(eventKey)) {
+                        filteredByConsumed++;
+                        traceData.filteredByConsumed.push({
+                            ...rawRecord,
+                            filterReason: '源记录已在历史增量中消费'
+                        });
+                        continue;
+                    }
+
                     if (checkDuplicate(dedupeKey, opTimeMs, recordType)) {
                         duplicateCount++;
                         traceData.filteredByDedup.push({
@@ -1404,13 +1691,21 @@ class DualSyncEngine {
                     
                     addToSeenRecords(dedupeKey, opTimeMs, recordType);
                     totalProcessed++;
-                    
-                    // 汇总变化量
-                    if (!changes[barcode]) {
-                        changes[barcode] = { totalChange: 0, recordsCount: 0 };
-                    }
-                    changes[barcode].totalChange += stockChange.change;
-                    changes[barcode].recordsCount++;
+
+                    const bucket = ensureChangeBucket(barcode);
+                    bucket.totalChange += stockChange.change;
+                    bucket.recordsCount++;
+                    appendSourceEvent(bucket, {
+                        eventKey,
+                        recordType,
+                        barcode,
+                        bizId: rawRecord.bizId,
+                        eleBizId: rawRecord.eleBizId,
+                        oldStock: rawRecord.oldStock,
+                        newStock: rawRecord.newStock,
+                        changeAmount: rawRecord.change,
+                        opTime: rawRecord.opTimeIso
+                    });
                 }
                 continue;
             }
@@ -1450,6 +1745,7 @@ class DualSyncEngine {
                 newStock: log.stock_change.new_stock,
                 change: log.stock_change.change,
                 opTime: log.op_time,
+                opTimeIso: this._getLocalIsoFromOpTime(log.op_time),
                 opUser: log.op_user,
                 opContent: log.op_content,   // 保存原始内容便于追溯
                 isMultiSpec: false
@@ -1459,7 +1755,7 @@ class DualSyncEngine {
             // 工具回流过滤：命中指纹且时间差在阈值内才跳过
             if (excludeFingerprintMap && excludeFingerprintMap.has(dedupeKey)) {
                 const appliedAtList = excludeFingerprintMap.get(dedupeKey);
-                const opTimeMs = getOpTimeMs(log.op_time);
+                const opTimeMs = this._getOpTimeMs(log.op_time);
                 // 检查是否有任意一个 appliedAt 与 opTime 时间差在阈值内
                 const isWithinThreshold = appliedAtList.some(appliedAt => {
                     const appliedAtMs = new Date(appliedAt).getTime();
@@ -1479,10 +1775,19 @@ class DualSyncEngine {
                     fingerprintTimeSkipped++;
                 }
             }
-            
-            // 去重判断：根据 opUser 类型区分
-            const opTimeMsSingle = getOpTimeMs(log.op_time);
-            const recordTypeSingle = getRecordType(log.op_user);
+
+            const opTimeMsSingle = this._getOpTimeMs(log.op_time);
+            const recordTypeSingle = this._getRecordType(log.op_user);
+            const eventKey = this._buildSourceEventKey(side, rawRecord, recordTypeSingle);
+            if (consumedEventKeySet && consumedEventKeySet.has(eventKey)) {
+                filteredByConsumed++;
+                traceData.filteredByConsumed.push({
+                    ...rawRecord,
+                    filterReason: '源记录已在历史增量中消费'
+                });
+                continue;
+            }
+
             if (checkDuplicate(dedupeKey, opTimeMsSingle, recordTypeSingle)) {
                 duplicateCount++;
                 traceData.filteredByDedup.push({
@@ -1494,13 +1799,21 @@ class DualSyncEngine {
             
             addToSeenRecords(dedupeKey, opTimeMsSingle, recordTypeSingle);
             totalProcessed++;
-            
-            // 汇总变化量
-            if (!changes[log.barcode]) {
-                changes[log.barcode] = { totalChange: 0, recordsCount: 0 };
-            }
-            changes[log.barcode].totalChange += log.stock_change.change;
-            changes[log.barcode].recordsCount++;
+
+            const bucket = ensureChangeBucket(log.barcode);
+            bucket.totalChange += log.stock_change.change;
+            bucket.recordsCount++;
+            appendSourceEvent(bucket, {
+                eventKey,
+                recordType: recordTypeSingle,
+                barcode: rawRecord.barcode,
+                bizId: rawRecord.bizId,
+                eleBizId: rawRecord.eleBizId,
+                oldStock: rawRecord.oldStock,
+                newStock: rawRecord.newStock,
+                changeAmount: rawRecord.change,
+                opTime: rawRecord.opTimeIso
+            });
         }
         
         // 记录跳过的记录
@@ -1520,6 +1833,9 @@ class DualSyncEngine {
         }
         if (filteredByFingerprint > 0) {
             this._log('info', `[${side}饿了么] 指纹过滤: 移除 ${filteredByFingerprint} 条工具回流记录`);
+        }
+        if (filteredByConsumed > 0) {
+            this._log('info', `[${side}饿了么] 历史消费过滤: 移除 ${filteredByConsumed} 条已处理过的源记录`);
         }
         if (fingerprintTimeSkipped > 0) {
             this._log('info', `[${side}饿了么] 指纹时间校验: ${fingerprintTimeSkipped} 条记录命中指纹但时间差>${fingerprintThresholdMinutes}分钟，视为真实变更`);
@@ -1633,7 +1949,8 @@ class DualSyncEngine {
                 skuId: targetInfo.skuId,
                 currentStock,
                 changeAmount: change.totalChange,
-                targetStock: newStock
+                targetStock: newStock,
+                sourceEvents: Array.isArray(change.sourceEvents) ? change.sourceEvents : []
             });
         }
 
@@ -1659,7 +1976,8 @@ class DualSyncEngine {
                     currentStock: d.currentStock,
                     changeAmount: d.changeAmount,
                     targetStock: d.targetStock,
-                    recordsCount: changes[d.barcode]?.recordsCount || 1
+                    recordsCount: changes[d.barcode]?.recordsCount || 1,
+                    sourceEvents: d.sourceEvents || []
                 }))
             };
         }
@@ -1687,7 +2005,8 @@ class DualSyncEngine {
                             currentStock: detail.currentStock,
                             changeAmount: detail.changeAmount,
                             targetStock: detail.targetStock,
-                            recordsCount: changes[detail.barcode]?.recordsCount || 1
+                            recordsCount: changes[detail.barcode]?.recordsCount || 1,
+                            sourceEvents: detail.sourceEvents || []
                         });
                     }
                     // 写入库存快照（用于后续核对）
@@ -1716,6 +2035,25 @@ class DualSyncEngine {
                                 options.destSide,
                                 options.directionCode || null,
                                 items
+                            );
+                        }
+                    }
+
+                    if (!this.debugMode && options && options.sourceSide && options.markSourceConsumed !== false) {
+                        const consumedAt = toLocalISOString(new Date());
+                        const consumedItems = batchDetails
+                            .flatMap(detail => Array.isArray(detail.sourceEvents) ? detail.sourceEvents : [])
+                            .filter(event => event && event.eventKey && event.opTime);
+                        if (consumedItems.length > 0) {
+                            this.db.addDualSyncConsumedEvents(
+                                this.groupId,
+                                options.syncRunId || null,
+                                options.sourceSide,
+                                options.directionCode || null,
+                                consumedItems.map(event => ({
+                                    ...event,
+                                    consumedAt
+                                }))
                             );
                         }
                     }

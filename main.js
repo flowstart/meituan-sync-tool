@@ -625,7 +625,8 @@ ipcMain.handle('get-config', async () => {
             debugMode: db.getConfig('debug_mode', 'false') === 'true',
             cookiesCheckInterval: parseInt(db.getConfig('cookies_check_interval', '24')),
             dualFingerprintTimeThresholdMinutes: parseInt(db.getConfig('dual_fingerprint_time_threshold_minutes', '5')),
-            platformDedupTimeThresholdSeconds: parseInt(db.getConfig('platform_dedup_time_threshold_seconds', '10'))
+            platformDedupTimeThresholdSeconds: parseInt(db.getConfig('platform_dedup_time_threshold_seconds', '10')),
+            incrementalLookbackMinutes: parseInt(db.getConfig('incremental_lookback_minutes', '30'))
         };
     } catch (error) {
         logger.error('获取全局配置失败:', error);
@@ -647,6 +648,7 @@ ipcMain.handle('save-config', async (event, config) => {
         db.setConfig('cookies_check_interval', config.cookiesCheckInterval.toString());
         db.setConfig('dual_fingerprint_time_threshold_minutes', String(config.dualFingerprintTimeThresholdMinutes ?? 5));
         db.setConfig('platform_dedup_time_threshold_seconds', String(config.platformDedupTimeThresholdSeconds ?? 10));
+        db.setConfig('incremental_lookback_minutes', String(config.incrementalLookbackMinutes ?? 30));
         
         // 刷新所有缓存的引擎，确保使用新配置（特别是 debugMode）
         syncManager.refreshAllEngines();
@@ -1187,6 +1189,264 @@ ipcMain.handle('dual-sync-get-last-full-sync-time', async (event, { groupId }) =
         return { success: true, time };
     } catch (error) {
         logger.error(`获取全量同步时间失败 (组${groupId}):`, error);
+        return { success: false, error: error.message };
+    }
+});
+
+// ==================== 商品对账功能 ====================
+
+/**
+ * 商品对账 IPC 处理器
+ * 用于诊断单个商品的库存同步状态，找出遗漏的记录
+ */
+ipcMain.handle('product-reconciliation', async (event, { groupId, barcode }) => {
+    try {
+        logger.info(`开始商品对账: 组${groupId}, 条形码${barcode}`);
+        
+        // 获取组信息和基线时间
+        const groupInfo = db.getDualSyncGroupBaselineInfo(groupId);
+        if (!groupInfo) {
+            return { success: false, error: '双向同步组不存在' };
+        }
+
+        const {
+            full_sync_a_baseline_time: aBaselineTime,
+            full_sync_b_baseline_time: bBaselineTime,
+            a_eleme_cookies: aElemeCookies,
+            a_eleme_seller_id: aElemeSellerId,
+            a_eleme_store_id: aElemeStoreId,
+            a_qnh_cookies: aQnhCookies,
+            a_qnh_store_id: aQnhStoreId,
+            b_eleme_cookies: bElemeCookies,
+            b_eleme_seller_id: bElemeSellerId,
+            b_eleme_store_id: bElemeStoreId,
+            b_qnh_cookies: bQnhCookies,
+            b_qnh_store_id: bQnhStoreId
+        } = groupInfo;
+
+        if (!aBaselineTime || !bBaselineTime) {
+            return { success: false, error: '未找到全量同步基线时间，请先执行全量同步' };
+        }
+
+        const ElemeClient = require('./api/eleme-client');
+        const createQnhClient = require('./api/qnh-client-factory');
+        const { ElemeParser } = require('./utils/parsers');
+        const { toLocalISOString } = require('./utils/time-utils');
+
+        const result = {
+            barcode,
+            groupId,
+            // 库存对比
+            stockComparison: {
+                aQnhStock: null,
+                bQnhStock: null,
+                diff: null
+            },
+            // A侧对账结果
+            aSide: {
+                baselineTime: aBaselineTime,
+                elemeRecords: [],
+                traceRecords: [],
+                missingRecords: []
+            },
+            // B侧对账结果
+            bSide: {
+                baselineTime: bBaselineTime,
+                elemeRecords: [],
+                traceRecords: [],
+                missingRecords: []
+            }
+        };
+
+        const now = new Date();
+        const nowIso = toLocalISOString(now);
+        const nowTimestamp = Math.floor(now.getTime() / 1000);
+
+        // 1. 查询 A/B 牵牛花当前库存
+        try {
+            const aQnhClient = createQnhClient(null, { cookies: aQnhCookies });
+            const aStockData = await aQnhClient.getStockByBarcodes(aQnhStoreId, [barcode]);
+            if (aStockData[barcode]) {
+                result.stockComparison.aQnhStock = aStockData[barcode].stock;
+            }
+        } catch (error) {
+            logger.warn(`查询A牵牛花库存失败: ${error.message}`);
+        }
+
+        try {
+            const bQnhClient = createQnhClient(null, { cookies: bQnhCookies });
+            const bStockData = await bQnhClient.getStockByBarcodes(bQnhStoreId, [barcode]);
+            if (bStockData[barcode]) {
+                result.stockComparison.bQnhStock = bStockData[barcode].stock;
+            }
+        } catch (error) {
+            logger.warn(`查询B牵牛花库存失败: ${error.message}`);
+        }
+
+        // 计算库存差值
+        if (result.stockComparison.aQnhStock !== null && result.stockComparison.bQnhStock !== null) {
+            result.stockComparison.diff = result.stockComparison.aQnhStock - result.stockComparison.bQnhStock;
+        }
+
+        // 2. 查询 A 饿了么操作记录（从基线时间到当前）
+        try {
+            const aElemeClient = new ElemeClient({
+                cookies: aElemeCookies,
+                seller_id: aElemeSellerId,
+                store_id: aElemeStoreId
+            });
+
+            const aStartTimestamp = Math.floor(new Date(aBaselineTime).getTime() / 1000);
+            let aAllLogs = [];
+            let aPage = 1;
+
+            // 分页查询（使用条形码过滤）
+            while (true) {
+                const logsData = await aElemeClient.queryOperationLog(
+                    aStartTimestamp,
+                    nowTimestamp,
+                    aPage,
+                    100,
+                    0,
+                    barcode  // 使用条形码过滤
+                );
+
+                const logs = logsData.data || [];
+                aAllLogs.push(...logs);
+
+                if (aPage * 100 >= (logsData.total || 0) || logs.length === 0) {
+                    break;
+                }
+                aPage++;
+            }
+
+            // 解析操作记录
+            const aParsedLogs = ElemeParser.parseOperationLogs({ data: aAllLogs });
+            result.aSide.elemeRecords = aParsedLogs.map(log => ({
+                opTime: log.op_time,
+                opUser: log.op_user,
+                oldStock: log.stock_change?.old_stock,
+                newStock: log.stock_change?.new_stock,
+                change: log.stock_change?.change
+            }));
+        } catch (error) {
+            logger.warn(`查询A饿了么操作记录失败: ${error.message}`);
+        }
+
+        // 3. 查询 B 饿了么操作记录（从基线时间到当前）
+        try {
+            const bElemeClient = new ElemeClient({
+                cookies: bElemeCookies,
+                seller_id: bElemeSellerId,
+                store_id: bElemeStoreId
+            });
+
+            const bStartTimestamp = Math.floor(new Date(bBaselineTime).getTime() / 1000);
+            let bAllLogs = [];
+            let bPage = 1;
+
+            // 分页查询（使用条形码过滤）
+            while (true) {
+                const logsData = await bElemeClient.queryOperationLog(
+                    bStartTimestamp,
+                    nowTimestamp,
+                    bPage,
+                    100,
+                    0,
+                    barcode  // 使用条形码过滤
+                );
+
+                const logs = logsData.data || [];
+                bAllLogs.push(...logs);
+
+                if (bPage * 100 >= (logsData.total || 0) || logs.length === 0) {
+                    break;
+                }
+                bPage++;
+            }
+
+            // 解析操作记录
+            const bParsedLogs = ElemeParser.parseOperationLogs({ data: bAllLogs });
+            result.bSide.elemeRecords = bParsedLogs.map(log => ({
+                opTime: log.op_time,
+                opUser: log.op_user,
+                oldStock: log.stock_change?.old_stock,
+                newStock: log.stock_change?.new_stock,
+                change: log.stock_change?.change
+            }));
+        } catch (error) {
+            logger.warn(`查询B饿了么操作记录失败: ${error.message}`);
+        }
+
+        // 4. 查询本地追溯记录
+        // A->B 方向的追溯记录（A饿了么变化同步到B）
+        const aTraceRecords = db.getTraceRecordsByBarcodeAndTimeRange(
+            groupId, barcode, aBaselineTime, nowIso, 'A->B'
+        );
+        result.aSide.traceRecords = aTraceRecords.map(r => ({
+            syncTime: r.created_at,
+            direction: r.direction,
+            sourceTotalChange: r.source_total_change,
+            targetStock: r.target_stock,
+            applyResult: r.apply_result
+        }));
+
+        // B->A 方向的追溯记录（B饿了么变化同步到A）
+        const bTraceRecords = db.getTraceRecordsByBarcodeAndTimeRange(
+            groupId, barcode, bBaselineTime, nowIso, 'B->A'
+        );
+        result.bSide.traceRecords = bTraceRecords.map(r => ({
+            syncTime: r.created_at,
+            direction: r.direction,
+            sourceTotalChange: r.source_total_change,
+            targetStock: r.target_stock,
+            applyResult: r.apply_result
+        }));
+
+        // 5. 对比找出缺失的记录
+        // 构建追溯记录的指纹集合（用于对比）
+        const buildFingerprintSet = (traceRecords) => {
+            const set = new Set();
+            for (const r of traceRecords) {
+                // 使用变化量作为简单的指纹
+                if (r.sourceTotalChange !== null && r.sourceTotalChange !== undefined) {
+                    set.add(r.sourceTotalChange);
+                }
+            }
+            return set;
+        };
+
+        // A侧：找出饿了么有但追溯表没有的记录
+        // 注意：这是一个简化的对比逻辑，实际可能需要更复杂的匹配
+        const aTraceFingerprintSet = buildFingerprintSet(result.aSide.traceRecords);
+        for (const record of result.aSide.elemeRecords) {
+            // 排除工具同步产生的记录（包含【API】或【子门店】）
+            if (record.opUser && (record.opUser.includes('【API】') || record.opUser.includes('【子门店】'))) {
+                continue;
+            }
+            // 检查是否在追溯记录中
+            if (record.change !== null && record.change !== undefined && !aTraceFingerprintSet.has(record.change)) {
+                result.aSide.missingRecords.push(record);
+            }
+        }
+
+        // B侧：同理
+        const bTraceFingerprintSet = buildFingerprintSet(result.bSide.traceRecords);
+        for (const record of result.bSide.elemeRecords) {
+            // 排除工具同步产生的记录
+            if (record.opUser && (record.opUser.includes('【API】') || record.opUser.includes('【子门店】'))) {
+                continue;
+            }
+            // 检查是否在追溯记录中
+            if (record.change !== null && record.change !== undefined && !bTraceFingerprintSet.has(record.change)) {
+                result.bSide.missingRecords.push(record);
+            }
+        }
+
+        logger.info(`商品对账完成: A侧缺失${result.aSide.missingRecords.length}条, B侧缺失${result.bSide.missingRecords.length}条`);
+        return { success: true, data: result };
+    } catch (error) {
+        logger.error(`商品对账失败: ${error.message}`);
         return { success: false, error: error.message };
     }
 });

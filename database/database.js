@@ -233,7 +233,31 @@ class SyncDatabase {
             )
         `);
 
-        // 8.2 双向同步：断点续跑（增量写入 pending 列表）
+        // 8.2 双向同步：记录“已经消费过的源事件”，避免回溯窗口内重复消费
+        this.db.exec(`
+            CREATE TABLE IF NOT EXISTS dual_sync_consumed_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                sync_run_id INTEGER,
+                source_side TEXT NOT NULL, -- A / B，表示源记录来自哪一侧饿了么
+                direction TEXT,
+                event_key TEXT NOT NULL,
+                record_type TEXT,
+                barcode TEXT NOT NULL,
+                biz_id TEXT,
+                ele_biz_id TEXT,
+                old_stock INTEGER,
+                new_stock INTEGER,
+                change_amount INTEGER,
+                op_time TEXT NOT NULL,
+                consumed_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(group_id, source_side, event_key),
+                FOREIGN KEY (group_id) REFERENCES dual_sync_groups(id) ON DELETE CASCADE
+            )
+        `);
+
+        // 8.3 双向同步：断点续跑（增量写入 pending 列表）
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS dual_sync_pending_change (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,6 +267,7 @@ class SyncDatabase {
                 dest_side TEXT NOT NULL,      -- 'A' / 'B'
                 barcode TEXT NOT NULL,
                 delta INTEGER NOT NULL,
+                source_events_json TEXT,
                 status TEXT NOT NULL DEFAULT 'pending', -- pending/applied/failed
                 error_msg TEXT,
                 created_at TEXT NOT NULL,
@@ -252,7 +277,7 @@ class SyncDatabase {
             )
         `);
 
-        // 8.3 双向同步：追溯记录表（用于排查库存不一致问题）
+        // 8.4 双向同步：追溯记录表（用于排查库存不一致问题）
         this.db.exec(`
             CREATE TABLE IF NOT EXISTS dual_sync_trace (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,6 +320,8 @@ class SyncDatabase {
             CREATE INDEX IF NOT EXISTS idx_dual_sync_stock_barcode ON dual_sync_stock_snapshot(barcode);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_applied_change_group_side_time ON dual_sync_applied_change(group_id, dest_side, applied_at);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_applied_change_fingerprint ON dual_sync_applied_change(group_id, dest_side, barcode, old_stock, new_stock);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_consumed_event_group_side_time ON dual_sync_consumed_event(group_id, source_side, op_time);
+            CREATE INDEX IF NOT EXISTS idx_dual_sync_consumed_event_group_side_key ON dual_sync_consumed_event(group_id, source_side, event_key);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_pending_group_run_status ON dual_sync_pending_change(group_id, sync_run_id, status);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_pending_group_status ON dual_sync_pending_change(group_id, status);
             CREATE INDEX IF NOT EXISTS idx_dual_sync_trace_barcode ON dual_sync_trace(group_id, barcode, created_at);
@@ -352,7 +379,10 @@ class SyncDatabase {
                 { name: 'last_a_apply_start_time', type: 'TEXT' },
                 { name: 'last_a_apply_end_time', type: 'TEXT' },
                 { name: 'last_b_apply_start_time', type: 'TEXT' },
-                { name: 'last_b_apply_end_time', type: 'TEXT' }
+                { name: 'last_b_apply_end_time', type: 'TEXT' },
+                // 全量同步基线时间（用于增量回溯边界保护）
+                { name: 'full_sync_a_baseline_time', type: 'TEXT' },
+                { name: 'full_sync_b_baseline_time', type: 'TEXT' }
             ];
 
             for (const column of dualColumnsToAdd) {
@@ -387,6 +417,17 @@ class SyncDatabase {
                     } catch (error) {
                         console.error(`[Database] ❌ 添加列失败(dual_history) (${column.name}):`, error.message);
                     }
+                }
+            }
+
+            const pendingInfo = this.db.prepare("PRAGMA table_info(dual_sync_pending_change)").all();
+            const pendingCols = new Set(pendingInfo.map(col => col.name));
+            if (!pendingCols.has('source_events_json')) {
+                try {
+                    this.db.exec(`ALTER TABLE dual_sync_pending_change ADD COLUMN source_events_json TEXT`);
+                    console.log('[Database] ✅ 添加列(pending): source_events_json');
+                } catch (error) {
+                    console.error('[Database] ❌ 添加列失败(pending) (source_events_json):', error.message);
                 }
             }
             
@@ -1073,7 +1114,9 @@ class SyncDatabase {
             'last_a_query_time', 'last_b_query_time',
             // 工具写入窗口（用于过滤饿了么回流 API 操作记录）
             'last_a_apply_start_time', 'last_a_apply_end_time',
-            'last_b_apply_start_time', 'last_b_apply_end_time'
+            'last_b_apply_start_time', 'last_b_apply_end_time',
+            // 全量同步基线时间（用于对账和增量回溯边界保护）
+            'full_sync_a_baseline_time', 'full_sync_b_baseline_time'
         ];
         
         const fields = [];
@@ -1232,7 +1275,7 @@ class SyncDatabase {
      * @param {number} syncRunId - dual_sync_history.id
      * @param {string} directionCode - 'A->B' / 'B->A'
      * @param {string} destSide - 'A' / 'B'
-     * @param {Array<{barcode: string, delta: number}>} items
+     * @param {Array<{barcode: string, delta: number, sourceEvents?: Array}>} items
      */
     addDualSyncPendingChanges(groupId, syncRunId, directionCode, destSide, items) {
         if (!items || items.length === 0) return;
@@ -1241,8 +1284,8 @@ class SyncDatabase {
         const stmt = this.db.prepare(`
             INSERT OR IGNORE INTO dual_sync_pending_change (
                 group_id, sync_run_id, direction_code, dest_side,
-                barcode, delta, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                barcode, delta, source_events_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         `);
 
         const transaction = this.db.transaction((rows) => {
@@ -1254,6 +1297,7 @@ class SyncDatabase {
                     destSide,
                     row.barcode,
                     row.delta,
+                    row.sourceEvents ? JSON.stringify(row.sourceEvents) : null,
                     now,
                     now
                 );
@@ -1267,7 +1311,7 @@ class SyncDatabase {
      */
     getDualSyncPendingChanges(groupId, syncRunId, directionCode = null, status = 'pending') {
         let sql = `
-            SELECT direction_code, dest_side, barcode, delta, status
+            SELECT direction_code, dest_side, barcode, delta, source_events_json, status
             FROM dual_sync_pending_change
             WHERE group_id = ? AND sync_run_id = ? AND status = ?
         `;
@@ -1277,7 +1321,10 @@ class SyncDatabase {
             params.push(directionCode);
         }
         sql += ` ORDER BY id ASC`;
-        return this.db.prepare(sql).all(...params);
+        return this.db.prepare(sql).all(...params).map(row => ({
+            ...row,
+            sourceEvents: row.source_events_json ? JSON.parse(row.source_events_json) : []
+        }));
     }
 
     /**
@@ -1388,6 +1435,85 @@ class SyncDatabase {
         } catch (e) {
             // 清理失败不影响主流程
         }
+    }
+
+    /**
+     * 批量写入“已经成功消费过的源事件”
+     * 用于处理增量回溯时，同一条真实饿了么记录再次被查询到的问题
+     * @param {number} groupId
+     * @param {number|null} syncRunId
+     * @param {string} sourceSide - 'A' | 'B'
+     * @param {string|null} direction - 'A->B' | 'B->A'
+     * @param {Array<Object>} items - [{eventKey, recordType, barcode, bizId, eleBizId, oldStock, newStock, changeAmount, opTime, consumedAt}]
+     */
+    addDualSyncConsumedEvents(groupId, syncRunId, sourceSide, direction, items) {
+        if (!items || items.length === 0) return;
+
+        const now = toLocalISOString();
+        const stmt = this.db.prepare(`
+            INSERT OR IGNORE INTO dual_sync_consumed_event (
+                group_id, sync_run_id, source_side, direction, event_key, record_type,
+                barcode, biz_id, ele_biz_id, old_stock, new_stock, change_amount,
+                op_time, consumed_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `);
+
+        const transaction = this.db.transaction((rows) => {
+            for (const row of rows) {
+                stmt.run(
+                    groupId,
+                    syncRunId || null,
+                    sourceSide,
+                    direction || null,
+                    row.eventKey,
+                    row.recordType || null,
+                    row.barcode,
+                    row.bizId || null,
+                    row.eleBizId || null,
+                    row.oldStock ?? null,
+                    row.newStock ?? null,
+                    row.changeAmount ?? null,
+                    row.opTime,
+                    row.consumedAt || now,
+                    now
+                );
+            }
+        });
+
+        transaction(items);
+
+        try {
+            const cutoff = toLocalISOString(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000));
+            this.db.prepare(`
+                DELETE FROM dual_sync_consumed_event
+                WHERE group_id = ? AND op_time < ?
+            `).run(groupId, cutoff);
+        } catch (_) {}
+    }
+
+    /**
+     * 获取某一侧在指定时间范围内已经消费过的源事件 key 集合
+     * @param {number} groupId
+     * @param {string} sourceSide - 'A' | 'B'
+     * @param {string} windowStartIso
+     * @param {string} windowEndIso
+     * @returns {Set<string>}
+     */
+    getDualSyncConsumedEventKeys(groupId, sourceSide, windowStartIso, windowEndIso) {
+        if (!windowStartIso || !windowEndIso) {
+            return new Set();
+        }
+
+        const rows = this.db.prepare(`
+            SELECT event_key
+            FROM dual_sync_consumed_event
+            WHERE group_id = ?
+              AND source_side = ?
+              AND op_time >= ?
+              AND op_time <= ?
+        `).all(groupId, sourceSide, windowStartIso, windowEndIso);
+
+        return new Set(rows.map(row => row.event_key).filter(Boolean));
     }
 
     /**
@@ -1728,6 +1854,63 @@ class SyncDatabase {
         `);
         const row = stmt.get(groupId);
         return row ? row.last_full_sync_time : null;
+    }
+
+    /**
+     * 按条形码和时间范围查询追溯记录（用于商品对账功能）
+     * @param {number} groupId - 双向同步组ID
+     * @param {string} barcode - 商品条形码
+     * @param {string} startTime - 开始时间（ISO格式）
+     * @param {string} endTime - 结束时间（ISO格式）
+     * @param {string|null} direction - 同步方向过滤（'A->B' 或 'B->A'），null表示全部
+     * @returns {Array<Object>} 追溯记录列表
+     */
+    getTraceRecordsByBarcodeAndTimeRange(groupId, barcode, startTime, endTime, direction = null) {
+        let sql = `
+            SELECT * FROM dual_sync_trace
+            WHERE group_id = ? AND barcode = ?
+              AND created_at >= ? AND created_at <= ?
+        `;
+        const params = [groupId, barcode, startTime, endTime];
+
+        if (direction) {
+            sql += ` AND direction = ?`;
+            params.push(direction);
+        }
+
+        sql += ` ORDER BY created_at ASC`;
+
+        const stmt = this.db.prepare(sql);
+        return stmt.all(...params);
+    }
+
+    /**
+     * 获取双向同步组的基线时间信息（用于商品对账功能）
+     * @param {number} groupId - 双向同步组ID
+     * @returns {Object|null} 包含基线时间的对象
+     */
+    getDualSyncGroupBaselineInfo(groupId) {
+        const stmt = this.db.prepare(`
+            SELECT 
+                full_sync_a_baseline_time,
+                full_sync_b_baseline_time,
+                last_a_query_time,
+                last_b_query_time,
+                last_full_sync_time,
+                a_eleme_cookies,
+                a_eleme_seller_id,
+                a_eleme_store_id,
+                a_qnh_cookies,
+                a_qnh_store_id,
+                b_eleme_cookies,
+                b_eleme_seller_id,
+                b_eleme_store_id,
+                b_qnh_cookies,
+                b_qnh_store_id
+            FROM dual_sync_groups
+            WHERE id = ?
+        `);
+        return stmt.get(groupId);
     }
 }
 

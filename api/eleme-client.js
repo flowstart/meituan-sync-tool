@@ -302,18 +302,19 @@ class ElemeClient {
                         foundJob = true;
                         const status = job.jobStatus;
                         const progress = job.executeProgress;
+                        const statusText = job.jobStatusText || '';
 
-                        console.log(`[Eleme] 任务状态: ${job.jobStatusText} (status=${status}), 进度: ${progress}%`);
+                        console.log(`[Eleme] 任务状态: ${statusText} (status=${status}), 进度: ${progress}%`);
 
                         // 状态3表示成功
                         if (status === 3 && progress === 100) {
                             console.log(`[Eleme] ✅ 任务完成: ${job.downloadFileKey}`);
                             try { if (typeof options.log === 'function') options.log('info', '饿了么导出任务完成'); } catch(_) {}
                             return job;
-                        } else if (status < 0) {
-                            // 失败状态
-                            console.error(`[Eleme] ❌ 任务失败 (status=${status}): ${job.resultMsg || '未知错误'}`);
-                            try { if (typeof options.log === 'function') options.log('error', `饿了么导出任务失败 (status=${status}): ${job.resultMsg || '未知错误'}`); } catch(_) {}
+                        } else if (status < 0 || status === 5 || /失败|取消/.test(statusText)) {
+                            // 饿了么导出失败状态并不总是负数，实测 status=5 也表示“执行失败”
+                            console.error(`[Eleme] ❌ 任务失败 (${statusText || '未知状态'}, status=${status}): ${job.resultMsg || '未知错误'}`);
+                            try { if (typeof options.log === 'function') options.log('error', `饿了么导出任务失败 (${statusText || '未知状态'}, status=${status}): ${job.resultMsg || '未知错误'}`); } catch(_) {}
                             return null;
                         }
 
@@ -512,9 +513,10 @@ class ElemeClient {
      * @param {number} pageNumber - 页码
      * @param {number} pageSize - 每页数量
      * @param {number} opType - 操作类型，0表示全部
+     * @param {string|null} barCode - 条形码过滤（可选，用于对账功能）
      * @returns {Promise<Object>} 操作记录数据
      */
-    async queryOperationLog(startTime, endTime, pageNumber = 1, pageSize = 100, opType = 0) {
+    async queryOperationLog(startTime, endTime, pageNumber = 1, pageSize = 100, opType = 0, barCode = null) {
         const apiPath = 'mtop.ele.newretail.item.oplog.queryOpLog';
 
         const reqData = {
@@ -526,6 +528,11 @@ class ElemeClient {
             opTimeStart: startTime,
             opTimeEnd: endTime
         };
+
+        // 如果指定了条形码，添加过滤参数
+        if (barCode) {
+            reqData.barCode = barCode;
+        }
 
         // 外层包装
         const data = {

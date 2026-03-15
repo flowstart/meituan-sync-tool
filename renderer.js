@@ -15,7 +15,8 @@ let globalConfig = {
     debugMode: false,
     cookiesCheckInterval: 24,
     dualFingerprintTimeThresholdMinutes: 5,
-    platformDedupTimeThresholdSeconds: 10
+    platformDedupTimeThresholdSeconds: 10,
+    incrementalLookbackMinutes: 30
 };
 // 运行状态缓存：避免重新渲染时丢失同步状态与按钮隐藏
 // 结构: { [groupId]: { syncing: boolean, type: 'full'|'incremental', progress?: number, message?: string } }
@@ -1720,6 +1721,7 @@ async function loadConfigToForm() {
         document.getElementById('cookiesCheckInterval').value = config.cookiesCheckInterval || 24;
         document.getElementById('dualFingerprintTimeThresholdMinutes').value = config.dualFingerprintTimeThresholdMinutes || 5;
         document.getElementById('platformDedupTimeThresholdSeconds').value = config.platformDedupTimeThresholdSeconds || 10;
+        document.getElementById('incrementalLookbackMinutes').value = config.incrementalLookbackMinutes || 30;
         
         // 获取并显示用户数据路径
         try {
@@ -1729,6 +1731,9 @@ async function loadConfigToForm() {
             console.error('获取数据路径失败:', pathError);
             document.getElementById('dataFilePath').value = '获取失败';
         }
+        
+        // 加载双向同步组到对账下拉框
+        await loadReconcileGroups();
         
         console.log('配置已加载到表单:', config);
     } catch (error) {
@@ -1748,7 +1753,8 @@ async function saveConfig() {
             debugMode: document.getElementById('debugMode').checked,
             cookiesCheckInterval: parseInt(document.getElementById('cookiesCheckInterval').value) || 24,
             dualFingerprintTimeThresholdMinutes: parseInt(document.getElementById('dualFingerprintTimeThresholdMinutes').value) || 5,
-            platformDedupTimeThresholdSeconds: parseInt(document.getElementById('platformDedupTimeThresholdSeconds').value) || 10
+            platformDedupTimeThresholdSeconds: parseInt(document.getElementById('platformDedupTimeThresholdSeconds').value) || 10,
+            incrementalLookbackMinutes: parseInt(document.getElementById('incrementalLookbackMinutes').value) || 30
         };
         
         // 验证配置
@@ -1774,6 +1780,11 @@ async function saveConfig() {
 
         if (config.platformDedupTimeThresholdSeconds < 1 || config.platformDedupTimeThresholdSeconds > 120) {
             alert('平台订单去重时间差阈值必须在1-120秒之间');
+            return;
+        }
+
+        if (config.incrementalLookbackMinutes < 0 || config.incrementalLookbackMinutes > 60) {
+            alert('增量同步回溯分钟数必须在0-60分钟之间');
             return;
         }
         
@@ -1803,10 +1814,150 @@ function resetConfig() {
         document.getElementById('cookiesCheckInterval').value = 24;
         document.getElementById('dualFingerprintTimeThresholdMinutes').value = 5;
         document.getElementById('platformDedupTimeThresholdSeconds').value = 10;
+        document.getElementById('incrementalLookbackMinutes').value = 30;
         
         console.log('配置已恢复为默认值');
         alert('✅ 已恢复默认配置，请点击「保存配置」按钮保存');
     }
+}
+
+// ==================== 商品对账功能 ====================
+
+/**
+ * 加载双向同步组到对账下拉框
+ */
+async function loadReconcileGroups() {
+    try {
+        const groups = await ipcRequest('dual-sync-get-groups');
+        const select = document.getElementById('reconcileGroupSelect');
+        if (!select) return;
+
+        // 清空现有选项（保留第一个占位选项）
+        select.innerHTML = '<option value="">-- 请选择 --</option>';
+
+        // 添加组选项
+        for (const group of groups) {
+            const option = document.createElement('option');
+            option.value = group.id;
+            option.textContent = group.name || `组${group.id}`;
+            select.appendChild(option);
+        }
+    } catch (error) {
+        console.error('加载双向同步组失败:', error);
+    }
+}
+
+/**
+ * 开始商品对账
+ */
+async function startProductReconcile() {
+    const groupId = document.getElementById('reconcileGroupSelect').value;
+    const barcode = document.getElementById('reconcileBarcodeInput').value.trim();
+
+    if (!groupId) {
+        alert('请选择双向同步组');
+        return;
+    }
+
+    if (!barcode) {
+        alert('请输入商品条形码');
+        return;
+    }
+
+    const btn = document.getElementById('startReconcileBtn');
+    const resultArea = document.getElementById('reconcileResultArea');
+
+    try {
+        // 禁用按钮，显示加载状态
+        btn.disabled = true;
+        btn.textContent = '对账中...';
+        resultArea.style.display = 'none';
+
+        // 调用对账 IPC
+        const result = await ipcRequest('product-reconciliation', { groupId: parseInt(groupId), barcode });
+
+        if (result.success) {
+            displayReconcileResult(result.data);
+            resultArea.style.display = 'block';
+        } else {
+            alert('对账失败: ' + result.error);
+        }
+    } catch (error) {
+        console.error('对账失败:', error);
+        alert('对账失败: ' + error.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '🔍 开始对账';
+    }
+}
+
+/**
+ * 展示对账结果
+ */
+function displayReconcileResult(data) {
+    // 1. 库存对比
+    const stockComparisonDiv = document.getElementById('stockComparisonResult');
+    const { aQnhStock, bQnhStock, diff } = data.stockComparison;
+
+    let stockHtml = `<div style="padding: 8px; background: #fff; border-radius: 4px;">`;
+    stockHtml += `<div>A牵牛花库存: <strong>${aQnhStock !== null ? aQnhStock : '未知'}</strong></div>`;
+    stockHtml += `<div>B牵牛花库存: <strong>${bQnhStock !== null ? bQnhStock : '未知'}</strong></div>`;
+    
+    if (diff !== null) {
+        const diffColor = diff === 0 ? '#52c41a' : '#ff4d4f';
+        const diffText = diff === 0 ? '库存一致' : `差值: ${diff > 0 ? '+' : ''}${diff}`;
+        stockHtml += `<div style="color: ${diffColor}; font-weight: bold; margin-top: 4px;">${diffText}</div>`;
+    }
+    stockHtml += `</div>`;
+    stockComparisonDiv.innerHTML = stockHtml;
+
+    // 2. A侧对账结果
+    const aSideDiv = document.getElementById('aSideReconcileResult');
+    let aHtml = `<div style="padding: 8px; background: #fff; border-radius: 4px;">`;
+    aHtml += `<div style="margin-bottom: 8px;">基线时间: ${data.aSide.baselineTime || '未设置'}</div>`;
+    aHtml += `<div>饿了么操作记录: ${data.aSide.elemeRecords.length} 条</div>`;
+    aHtml += `<div>本地追溯记录: ${data.aSide.traceRecords.length} 条</div>`;
+    
+    if (data.aSide.missingRecords.length > 0) {
+        aHtml += `<div style="color: #ff4d4f; font-weight: bold; margin-top: 8px;">可能遗漏的记录: ${data.aSide.missingRecords.length} 条</div>`;
+        aHtml += `<div style="margin-top: 4px; font-size: 12px; max-height: 100px; overflow-y: auto;">`;
+        for (const record of data.aSide.missingRecords.slice(0, 10)) {
+            const opTime = record.opTime ? new Date(record.opTime).toLocaleString() : '未知';
+            aHtml += `<div style="padding: 2px 0;">时间: ${opTime}, 变化: ${record.change}, 操作者: ${record.opUser || '未知'}</div>`;
+        }
+        if (data.aSide.missingRecords.length > 10) {
+            aHtml += `<div style="color: #999;">...还有 ${data.aSide.missingRecords.length - 10} 条</div>`;
+        }
+        aHtml += `</div>`;
+    } else {
+        aHtml += `<div style="color: #52c41a; margin-top: 8px;">未发现遗漏记录</div>`;
+    }
+    aHtml += `</div>`;
+    aSideDiv.innerHTML = aHtml;
+
+    // 3. B侧对账结果
+    const bSideDiv = document.getElementById('bSideReconcileResult');
+    let bHtml = `<div style="padding: 8px; background: #fff; border-radius: 4px;">`;
+    bHtml += `<div style="margin-bottom: 8px;">基线时间: ${data.bSide.baselineTime || '未设置'}</div>`;
+    bHtml += `<div>饿了么操作记录: ${data.bSide.elemeRecords.length} 条</div>`;
+    bHtml += `<div>本地追溯记录: ${data.bSide.traceRecords.length} 条</div>`;
+    
+    if (data.bSide.missingRecords.length > 0) {
+        bHtml += `<div style="color: #ff4d4f; font-weight: bold; margin-top: 8px;">可能遗漏的记录: ${data.bSide.missingRecords.length} 条</div>`;
+        bHtml += `<div style="margin-top: 4px; font-size: 12px; max-height: 100px; overflow-y: auto;">`;
+        for (const record of data.bSide.missingRecords.slice(0, 10)) {
+            const opTime = record.opTime ? new Date(record.opTime).toLocaleString() : '未知';
+            bHtml += `<div style="padding: 2px 0;">时间: ${opTime}, 变化: ${record.change}, 操作者: ${record.opUser || '未知'}</div>`;
+        }
+        if (data.bSide.missingRecords.length > 10) {
+            bHtml += `<div style="color: #999;">...还有 ${data.bSide.missingRecords.length - 10} 条</div>`;
+        }
+        bHtml += `</div>`;
+    } else {
+        bHtml += `<div style="color: #52c41a; margin-top: 8px;">未发现遗漏记录</div>`;
+    }
+    bHtml += `</div>`;
+    bSideDiv.innerHTML = bHtml;
 }
 
 // ==================== 暴露全局函数 ====================
@@ -1841,6 +1992,9 @@ window.doFullSync = doFullSync;
 // 全局配置
 window.saveConfig = saveConfig;
 window.resetConfig = resetConfig;
+
+// 商品对账
+window.startProductReconcile = startProductReconcile;
 
 // 失败日志
 window.viewFailedLogs = viewFailedLogs;
