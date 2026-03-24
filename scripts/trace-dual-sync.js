@@ -162,6 +162,217 @@ function summarizeRunRecords(records) {
     return Object.values(summary).sort((a, b) => a.direction.localeCompare(b.direction) || a.apply_result.localeCompare(b.apply_result));
 }
 
+function toFiniteNumber(value, fallback = 0) {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : fallback;
+}
+
+function uniq(values) {
+    return Array.from(new Set(values.filter(Boolean)));
+}
+
+function sumBy(rows, mapper) {
+    return rows.reduce((sum, row) => sum + toFiniteNumber(mapper(row), 0), 0);
+}
+
+function isAtOrAfter(value, sinceTime) {
+    if (!sinceTime) return true;
+    if (!value) return false;
+    return String(value) >= String(sinceTime);
+}
+
+function filterRowsBySinceTime(rows, timeField, sinceTime) {
+    if (!Array.isArray(rows)) return [];
+    return rows.filter(row => isAtOrAfter(row && row[timeField], sinceTime));
+}
+
+function filterTraceDetailsBySinceTime(rawDetails, sinceTime) {
+    if (!rawDetails) return null;
+    const filterBySyncTime = rows => filterRowsBySinceTime(rows, 'syncTime', sinceTime);
+    return {
+        ...rawDetails,
+        rawRecords: filterBySyncTime(rawDetails.rawRecords),
+        filteredRecords: filterBySyncTime(rawDetails.filteredRecords),
+        filteredFingerprintRecords: filterBySyncTime(rawDetails.filteredFingerprintRecords),
+        filteredConsumedRecords: filterBySyncTime(rawDetails.filteredConsumedRecords),
+        deduplicatedRecords: filterBySyncTime(rawDetails.deduplicatedRecords),
+        appliedRecords: filterBySyncTime(rawDetails.appliedRecords)
+    };
+}
+
+function buildBarcodeDiagnostics(barcodeReport, rawDetails) {
+    const warnings = [];
+    const sinceTime = barcodeReport.fullSyncBaseline ? barcodeReport.fullSyncBaseline.created_at : null;
+    const successRecords = barcodeReport.incrementalRecords.filter(item => item.apply_result === 'success');
+    const successDeltaSum = sumBy(successRecords, item => toFiniteNumber(item.target_stock) - toFiniteNumber(item.current_stock));
+    const successChangeSum = sumBy(successRecords, item => item.source_total_change);
+    const consumedChangeSum = sumBy(barcodeReport.consumedEvents, item => item.change_amount);
+    const zeroingSuccessCount = successRecords.filter(item => toFiniteNumber(item.current_stock) > 0 && toFiniteNumber(item.target_stock) === 0).length;
+
+    if (zeroingSuccessCount > 0) {
+        warnings.push({
+            level: 'high',
+            type: 'high_risk_zero',
+            message: `发现 ${zeroingSuccessCount} 条 success 把正库存直接写到 0`
+        });
+    }
+
+    if (successRecords.length > 0 && barcodeReport.consumedEvents.length > 0 && successDeltaSum !== consumedChangeSum) {
+        warnings.push({
+            level: 'high',
+            type: 'net_delta_mismatch',
+            message: `净变化不一致：successDelta=${successDeltaSum}, consumedDelta=${consumedChangeSum}, successChange=${successChangeSum}`
+        });
+    }
+
+    if (rawDetails && rawDetails.filteredConsumedRecords.length > 0) {
+        warnings.push({
+            level: 'info',
+            type: 'consumed_replay',
+            message: `发现 ${rawDetails.filteredConsumedRecords.length} 条历史已消费源事件再次落入查询窗口，但已被账本拦截`
+        });
+    }
+
+    if (rawDetails && rawDetails.rawRecords.length > 0) {
+        const groupMap = new Map();
+        for (const record of rawDetails.rawRecords) {
+            const key = [
+                record.side || '',
+                record.opTimeIso || record.opTime || '',
+                record.oldStock ?? '',
+                record.newStock ?? '',
+                record.change ?? ''
+            ].join('|');
+            if (!groupMap.has(key)) {
+                groupMap.set(key, {
+                    sample: record,
+                    syncRunIds: new Set(),
+                    syncTimes: new Set(),
+                    count: 0
+                });
+            }
+            const group = groupMap.get(key);
+            group.count++;
+            group.syncRunIds.add(record.syncRunId);
+            group.syncTimes.add(record.syncTime);
+        }
+
+        for (const group of groupMap.values()) {
+            if (group.count <= 1) continue;
+            const sample = group.sample;
+            const sourceSide = sample.side || '';
+            const direction = sourceSide === 'A' ? 'A->B' : sourceSide === 'B' ? 'B->A' : '';
+            const matchedConsumedCount = barcodeReport.consumedEvents.filter(item =>
+                item.source_side === sourceSide &&
+                item.op_time === (sample.opTimeIso || sample.opTime || null) &&
+                toFiniteNumber(item.old_stock, NaN) === toFiniteNumber(sample.oldStock, NaN) &&
+                toFiniteNumber(item.new_stock, NaN) === toFiniteNumber(sample.newStock, NaN)
+            ).length;
+            const matchedFilteredConsumedCount = (rawDetails.filteredConsumedRecords || []).filter(item =>
+                item.side === sourceSide &&
+                (item.opTimeIso || item.opTime || null) === (sample.opTimeIso || sample.opTime || null) &&
+                toFiniteNumber(item.oldStock, NaN) === toFiniteNumber(sample.oldStock, NaN) &&
+                toFiniteNumber(item.newStock, NaN) === toFiniteNumber(sample.newStock, NaN)
+            ).length;
+            const matchedDedupCount = (rawDetails.deduplicatedRecords || []).filter(item =>
+                item.side === sourceSide &&
+                (item.opTimeIso || item.opTime || null) === (sample.opTimeIso || sample.opTime || null) &&
+                toFiniteNumber(item.oldStock, NaN) === toFiniteNumber(sample.oldStock, NaN) &&
+                toFiniteNumber(item.newStock, NaN) === toFiniteNumber(sample.newStock, NaN)
+            ).length;
+            const matchedSuccessRunIds = uniq(successRecords
+                .filter(item =>
+                    item.direction === direction &&
+                    item.created_at === sample.syncTime &&
+                    toFiniteNumber(item.source_total_change, NaN) === toFiniteNumber(sample.change, NaN)
+                )
+                .map(item => item.sync_run_id));
+
+            if (matchedConsumedCount === 0 && matchedFilteredConsumedCount === 0 && matchedDedupCount === 0 && matchedSuccessRunIds.length > 1) {
+                warnings.push({
+                    level: 'high',
+                    type: 'repeat_success',
+                    message: `疑似重复消费：${sourceSide}侧 ${sample.opTimeIso || sample.opTime || '-'} ${sample.oldStock}->${sample.newStock} 在 ${group.syncRunIds.size} 轮查询中重复出现，且在 ${matchedSuccessRunIds.length} 个轮次里进入了 ${direction} success`,
+                    runIds: matchedSuccessRunIds
+                });
+            } else if (matchedFilteredConsumedCount > 0) {
+                warnings.push({
+                    level: 'info',
+                    type: 'consumed_replay_group',
+                    message: `历史来源事件回放已拦截：${sourceSide}侧 ${sample.opTimeIso || sample.opTime || '-'} ${sample.oldStock}->${sample.newStock} 在 ${group.syncRunIds.size} 轮查询中重复出现，但已被历史消费过滤`
+                });
+            }
+        }
+    }
+
+    const dedupedWarnings = [];
+    const seenMessages = new Set();
+    for (const warning of warnings) {
+        const key = `${warning.level}|${warning.type}|${warning.message}`;
+        if (seenMessages.has(key)) continue;
+        seenMessages.add(key);
+        dedupedWarnings.push(warning);
+    }
+
+    return {
+        warningCount: dedupedWarnings.length,
+        highRiskCount: dedupedWarnings.filter(item => item.level === 'high').length,
+        warnings: dedupedWarnings
+    };
+}
+
+function buildRunDiagnostics(runReport) {
+    const warnings = [];
+    const successRecords = runReport.traceRecords.filter(item => item.apply_result === 'success');
+    const successDeltaSum = sumBy(successRecords, item => toFiniteNumber(item.target_stock) - toFiniteNumber(item.current_stock));
+    const successChangeSum = sumBy(successRecords, item => item.source_total_change);
+    const consumedChangeSum = sumBy(runReport.consumedEvents, item => item.change_amount);
+    const zeroingSuccessCount = successRecords.filter(item => toFiniteNumber(item.current_stock) > 0 && toFiniteNumber(item.target_stock) === 0).length;
+    const filteredConsumedCount = runReport.traceRecords.filter(item => item.apply_result === 'filtered' && String(item.filter_reason || '').includes('历史增量中消费')).length;
+
+    if (zeroingSuccessCount > 0) {
+        warnings.push({
+            level: 'high',
+            type: 'high_risk_zero',
+            message: `发现 ${zeroingSuccessCount} 条 success 把正库存直接写到 0`
+        });
+    }
+
+    if (runReport.consumedEvents.length > 0 && successDeltaSum !== consumedChangeSum) {
+        warnings.push({
+            level: 'high',
+            type: 'net_delta_mismatch',
+            message: `净变化不一致：successDelta=${successDeltaSum}, consumedDelta=${consumedChangeSum}, successChange=${successChangeSum}`
+        });
+    }
+
+    if (filteredConsumedCount > 0) {
+        warnings.push({
+            level: 'info',
+            type: 'consumed_replay',
+            message: `本批次发现 ${filteredConsumedCount} 条历史来源事件回放，但已被历史消费账本拦截`
+        });
+    }
+
+    return {
+        warningCount: warnings.length,
+        highRiskCount: warnings.filter(item => item.level === 'high').length,
+        warnings
+    };
+}
+
+function printDiagnostics(diag) {
+    console.log(`自动诊断摘要: warning=${diag.warningCount}, high=${diag.highRiskCount}`);
+    if (diag.warnings.length === 0) {
+        console.log('  无明显告警');
+        return;
+    }
+    for (const warning of diag.warnings) {
+        const levelLabel = warning.level === 'high' ? '高危' : '提示';
+        console.log(`  [${levelLabel}] ${warning.message}`);
+    }
+}
+
 function findSinceDate(fullSyncBaseline) {
     if (fullSyncBaseline && typeof fullSyncBaseline.created_at === 'string') {
         return fullSyncBaseline.created_at.slice(0, 10);
@@ -213,20 +424,24 @@ function getBarcodeTrace(dbPath, groupId, barcode, limit) {
         LIMIT 1;
     `);
 
+    const appliedWhereSince = sinceTime ? `AND applied_at >= ${quote(sinceTime)}` : '';
     const appliedChanges = sqliteJson(dbPath, `
         SELECT sync_run_id, direction, dest_side, barcode, old_stock, new_stock, applied_at
         FROM dual_sync_applied_change
         WHERE group_id = ${groupId}
           AND barcode = ${quote(barcode)}
+          ${appliedWhereSince}
         ORDER BY applied_at ASC;
     `);
 
+    const consumedWhereSince = sinceTime ? `AND op_time >= ${quote(sinceTime)}` : '';
     const consumedEvents = sqliteJson(dbPath, `
         SELECT sync_run_id, source_side, direction, event_key, record_type, barcode,
                biz_id, ele_biz_id, old_stock, new_stock, change_amount, op_time, consumed_at
         FROM dual_sync_consumed_event
         WHERE group_id = ${groupId}
           AND barcode = ${quote(barcode)}
+          ${consumedWhereSince}
         ORDER BY consumed_at ASC;
     `);
 
@@ -281,6 +496,7 @@ function getRunReport(dbPath, dataDir, groupId, syncRunId) {
 }
 
 function printBarcodeReport(groupInfo, barcodeReport, rawDetails, args) {
+    const diagnostics = buildBarcodeDiagnostics(barcodeReport, rawDetails);
     console.log(`组: ${groupInfo.name} (${groupInfo.id})`);
     console.log(`条码: ${args.barcode}`);
     console.log(`最近全量: ${groupInfo.last_full_sync_time || '无'}`);
@@ -297,6 +513,7 @@ function printBarcodeReport(groupInfo, barcodeReport, rawDetails, args) {
     console.log(`增量记录数: ${barcodeReport.incrementalRecords.length}`);
     console.log(`指纹记录数: ${barcodeReport.appliedChanges.length}`);
     console.log(`已消费事件数: ${barcodeReport.consumedEvents.length}`);
+    printDiagnostics(diagnostics);
     if (barcodeReport.incrementalRecords.length > 0) {
         console.log('增量时间线:');
         for (const record of barcodeReport.incrementalRecords) {
@@ -312,21 +529,27 @@ function printBarcodeReport(groupInfo, barcodeReport, rawDetails, args) {
     if (barcodeReport.consumedEvents.length > 0) {
         console.log('已消费事件:');
         for (const item of barcodeReport.consumedEvents) {
-            console.log(`  [${item.consumed_at}] source=${item.source_side} ${item.direction || '-'} | ${item.record_type || '-'} | ${item.old_stock} -> ${item.new_stock} | change=${item.change_amount ?? '-'} | op=${item.op_time}`);
+            console.log(`  [${item.consumed_at}] source=${item.source_side} ${item.direction || '-'} | ${item.record_type || '-'} | ${item.old_stock} -> ${item.new_stock} | change=${item.change_amount ?? '-'} | op=${item.op_time} | key=${item.event_key}`);
         }
     }
     if (args.includeRaw && rawDetails) {
-        console.log(`原始记录: ${rawDetails.rawRecords.length} | 被过滤: ${rawDetails.filteredRecords.length} | 被去重: ${rawDetails.deduplicatedRecords.length} | 已落地: ${rawDetails.appliedRecords.length}`);
+        console.log(`原始记录: ${rawDetails.rawRecords.length} | 被过滤: ${rawDetails.filteredRecords.length} | 指纹过滤: ${rawDetails.filteredFingerprintRecords.length} | 历史消费过滤: ${rawDetails.filteredConsumedRecords.length} | 被去重: ${rawDetails.deduplicatedRecords.length} | 已落地: ${rawDetails.appliedRecords.length}`);
         if (rawDetails.rawRecords.length > 0) {
             console.log('原始记录明细:');
             for (const record of rawDetails.rawRecords) {
                 console.log(`  [${record.syncTime}] side=${record.side} | ${record.opTimeIso || record.opTime || '-'} | ${record.oldStock} -> ${record.newStock} | change=${record.change} | ${record.opUser || ''}`);
             }
         }
-        if (rawDetails.filteredRecords.length > 0) {
-            console.log('被过滤记录明细:');
-            for (const record of rawDetails.filteredRecords) {
+        if (rawDetails.filteredFingerprintRecords.length > 0) {
+            console.log('指纹过滤明细:');
+            for (const record of rawDetails.filteredFingerprintRecords) {
                 console.log(`  [${record.syncTime}] side=${record.side} | ${record.opTimeIso || record.opTime || '-'} | ${record.oldStock} -> ${record.newStock} | ${record.filterReason || ''}`);
+            }
+        }
+        if (rawDetails.filteredConsumedRecords.length > 0) {
+            console.log('历史消费过滤明细:');
+            for (const record of rawDetails.filteredConsumedRecords) {
+                console.log(`  [${record.syncTime}] side=${record.side} | ${record.opTimeIso || record.opTime || '-'} | ${record.oldStock} -> ${record.newStock} | ${record.filterReason || ''}${record.matchedConsumedKey ? ` | matched=${record.matchedConsumedKey}` : ''}`);
             }
         }
         if (rawDetails.deduplicatedRecords.length > 0) {
@@ -339,6 +562,7 @@ function printBarcodeReport(groupInfo, barcodeReport, rawDetails, args) {
 }
 
 function printRunReport(groupInfo, runReport, args) {
+    const diagnostics = buildRunDiagnostics(runReport);
     console.log(`组: ${groupInfo.name} (${groupInfo.id})`);
     console.log(`批次: ${args.syncRunId}`);
     if (!runReport.runInfo) {
@@ -351,6 +575,7 @@ function printRunReport(groupInfo, runReport, args) {
     console.log(`追溯记录数: ${runReport.traceRecords.length}`);
     console.log(`指纹记录数: ${runReport.appliedChanges.length}`);
     console.log(`已消费事件数: ${runReport.consumedEvents.length}`);
+    printDiagnostics(diagnostics);
     console.log('方向汇总:');
     for (const row of runReport.runSummary) {
         console.log(`  ${row.direction || '-'} / ${row.apply_result || '-'}: ${row.count} 条, filtered=${row.filtered_count}, dedup=${row.deduplicated_count}, target0=${row.zero_target_count}, positive->0=${row.positive_to_zero_count}`);
@@ -367,6 +592,7 @@ function printRunReport(groupInfo, runReport, args) {
 }
 
 function exportBarcodeExcel(groupInfo, barcodeReport, rawDetails, args) {
+    const diagnostics = buildBarcodeDiagnostics(barcodeReport, rawDetails);
     ensureDir(args.outputDir);
     const wb = XLSX.utils.book_new();
     addSheet(wb, '摘要', [{
@@ -378,10 +604,13 @@ function exportBarcodeExcel(groupInfo, barcodeReport, rawDetails, args) {
         fullSyncBaselineStock: barcodeReport.fullSyncBaseline ? barcodeReport.fullSyncBaseline.target_stock : '',
         currentSnapshotStock: barcodeReport.stockSnapshot ? barcodeReport.stockSnapshot.last_known_stock : '',
         currentSnapshotTime: barcodeReport.stockSnapshot ? barcodeReport.stockSnapshot.last_sync_time : '',
+        warningCount: diagnostics.warningCount,
+        highRiskCount: diagnostics.highRiskCount,
         incrementalCount: barcodeReport.incrementalRecords.length,
         appliedFingerprintCount: barcodeReport.appliedChanges.length,
         consumedEventCount: barcodeReport.consumedEvents.length
     }]);
+    addSheet(wb, '自动诊断', diagnostics.warnings);
     addSheet(wb, '全量基线', barcodeReport.fullSyncBaseline ? [barcodeReport.fullSyncBaseline] : []);
     addSheet(wb, '增量追溯', barcodeReport.incrementalRecords);
     addSheet(wb, '指纹记录', barcodeReport.appliedChanges);
@@ -389,6 +618,8 @@ function exportBarcodeExcel(groupInfo, barcodeReport, rawDetails, args) {
     if (args.includeRaw && rawDetails) {
         addSheet(wb, '原始记录', rawDetails.rawRecords);
         addSheet(wb, '过滤记录', rawDetails.filteredRecords);
+        addSheet(wb, '指纹过滤记录', rawDetails.filteredFingerprintRecords);
+        addSheet(wb, '历史消费过滤记录', rawDetails.filteredConsumedRecords);
         addSheet(wb, '去重记录', rawDetails.deduplicatedRecords);
         addSheet(wb, '落地记录', rawDetails.appliedRecords);
     }
@@ -398,6 +629,7 @@ function exportBarcodeExcel(groupInfo, barcodeReport, rawDetails, args) {
 }
 
 function exportRunExcel(groupInfo, runReport, args) {
+    const diagnostics = buildRunDiagnostics(runReport);
     ensureDir(args.outputDir);
     const wb = XLSX.utils.book_new();
     addSheet(wb, '摘要', [{
@@ -408,10 +640,13 @@ function exportRunExcel(groupInfo, runReport, args) {
         status: runReport.runInfo ? runReport.runInfo.status : '',
         startTime: runReport.runInfo ? runReport.runInfo.start_time : '',
         endTime: runReport.runInfo ? runReport.runInfo.end_time : '',
+        warningCount: diagnostics.warningCount,
+        highRiskCount: diagnostics.highRiskCount,
         traceRecordCount: runReport.traceRecords.length,
         appliedFingerprintCount: runReport.appliedChanges.length,
         consumedEventCount: runReport.consumedEvents.length
     }]);
+    addSheet(wb, '自动诊断', diagnostics.warnings);
     addSheet(wb, '方向汇总', runReport.runSummary);
     addSheet(wb, '追溯记录', runReport.traceRecords);
     addSheet(wb, '指纹记录', runReport.appliedChanges);
@@ -435,9 +670,10 @@ async function main() {
 
     if (args.barcode) {
         const barcodeReport = getBarcodeTrace(args.dbPath, args.groupId, args.barcode, args.limit);
-        const rawDetails = args.includeRaw
-            ? getTraceRecordsByBarcode(args.dataDir, args.groupId, args.barcode, findSinceDate(barcodeReport.fullSyncBaseline), args.limit)
-            : null;
+        const rawDetails = filterTraceDetailsBySinceTime(
+            getTraceRecordsByBarcode(args.dataDir, args.groupId, args.barcode, findSinceDate(barcodeReport.fullSyncBaseline), args.limit),
+            barcodeReport.fullSyncBaseline ? barcodeReport.fullSyncBaseline.created_at : null
+        );
 
         printBarcodeReport(groupInfo, barcodeReport, rawDetails, args);
 

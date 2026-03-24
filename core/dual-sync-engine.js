@@ -144,7 +144,7 @@ class DualSyncEngine {
         return toLocalISOString(new Date(opTimeMs));
     }
 
-    _buildSourceEventKey(side, rawRecord, recordType = null) {
+    _buildLegacySourceEventKey(side, rawRecord, recordType = null) {
         const type = recordType || this._getRecordType(rawRecord.opUser);
         const bizId = rawRecord.bizId || '-';
         const eleBizId = rawRecord.eleBizId || '-';
@@ -160,6 +160,37 @@ class DualSyncEngine {
         const opTimeMs = this._getOpTimeMs(rawRecord.opTime);
         const timePart = Number.isNaN(opTimeMs) ? String(rawRecord.opTime || '') : String(opTimeMs);
         return `${side}|${type}|${rawRecord.barcode}|${oldStock}|${newStock}|${timePart}`;
+    }
+
+    _buildSourceEventKeyInfo(side, rawRecord, recordType = null) {
+        const type = recordType || this._getRecordType(rawRecord.opUser);
+        const bizId = rawRecord.bizId || '-';
+        const eleBizId = rawRecord.eleBizId || '-';
+        const oldStock = rawRecord.oldStock ?? 'null';
+        const newStock = rawRecord.newStock ?? 'null';
+        const opTimeMs = this._getOpTimeMs(rawRecord.opTime);
+        const timePart = Number.isNaN(opTimeMs) ? String(rawRecord.opTime || '') : String(opTimeMs);
+        const legacyKey = this._buildLegacySourceEventKey(side, rawRecord, type);
+
+        let primaryKey = legacyKey;
+        // API/子门店记录即使带业务 ID，也必须把 opTime 带入 key；
+        // 否则不同时间的真实事件会错误压成同一个 key，导致新事件落账失败。
+        if (type === 'api' && (bizId !== '-' || eleBizId !== '-')) {
+            primaryKey = `${side}|${type}|${rawRecord.barcode}|${bizId}|${eleBizId}|${oldStock}|${newStock}|${timePart}`;
+        }
+
+        const matchKeys = primaryKey === legacyKey ? [primaryKey] : [primaryKey, legacyKey];
+
+        return {
+            recordType: type,
+            primaryKey,
+            legacyKey,
+            matchKeys
+        };
+    }
+
+    _buildSourceEventKey(side, rawRecord, recordType = null) {
+        return this._buildSourceEventKeyInfo(side, rawRecord, recordType).primaryKey;
     }
 
     _createBaselineStockMap(products) {
@@ -1669,35 +1700,40 @@ class DualSyncEngine {
                     }
 
                     const opTimeMs = this._getOpTimeMs(log.op_time);
-                    const recordType = this._getRecordType(log.op_user);
-                    const eventKey = this._buildSourceEventKey(side, rawRecord, recordType);
-                    if (consumedEventKeySet && consumedEventKeySet.has(eventKey)) {
+                    const eventKeyInfo = this._buildSourceEventKeyInfo(side, rawRecord, this._getRecordType(log.op_user));
+                    const matchedConsumedKey = consumedEventKeySet
+                        ? eventKeyInfo.matchKeys.find(key => consumedEventKeySet.has(key))
+                        : null;
+                    if (matchedConsumedKey) {
                         filteredByConsumed++;
                         traceData.filteredByConsumed.push({
                             ...rawRecord,
-                            filterReason: '源记录已在历史增量中消费'
+                            filterReason: '源记录已在历史增量中消费',
+                            matchedConsumedKey
                         });
                         continue;
                     }
 
-                    if (checkDuplicate(dedupeKey, opTimeMs, recordType)) {
+                    if (checkDuplicate(dedupeKey, opTimeMs, eventKeyInfo.recordType)) {
                         duplicateCount++;
                         traceData.filteredByDedup.push({
                             ...rawRecord,
-                            filterReason: getDedupFilterReason(recordType)
+                            filterReason: getDedupFilterReason(eventKeyInfo.recordType)
                         });
                         continue;
                     }
                     
-                    addToSeenRecords(dedupeKey, opTimeMs, recordType);
+                    addToSeenRecords(dedupeKey, opTimeMs, eventKeyInfo.recordType);
                     totalProcessed++;
 
                     const bucket = ensureChangeBucket(barcode);
                     bucket.totalChange += stockChange.change;
                     bucket.recordsCount++;
                     appendSourceEvent(bucket, {
-                        eventKey,
-                        recordType,
+                        eventKey: eventKeyInfo.primaryKey,
+                        legacyEventKey: eventKeyInfo.legacyKey !== eventKeyInfo.primaryKey ? eventKeyInfo.legacyKey : null,
+                        matchKeys: eventKeyInfo.matchKeys,
+                        recordType: eventKeyInfo.recordType,
                         barcode,
                         bizId: rawRecord.bizId,
                         eleBizId: rawRecord.eleBizId,
@@ -1777,35 +1813,40 @@ class DualSyncEngine {
             }
 
             const opTimeMsSingle = this._getOpTimeMs(log.op_time);
-            const recordTypeSingle = this._getRecordType(log.op_user);
-            const eventKey = this._buildSourceEventKey(side, rawRecord, recordTypeSingle);
-            if (consumedEventKeySet && consumedEventKeySet.has(eventKey)) {
+            const eventKeyInfoSingle = this._buildSourceEventKeyInfo(side, rawRecord, this._getRecordType(log.op_user));
+            const matchedConsumedKey = consumedEventKeySet
+                ? eventKeyInfoSingle.matchKeys.find(key => consumedEventKeySet.has(key))
+                : null;
+            if (matchedConsumedKey) {
                 filteredByConsumed++;
                 traceData.filteredByConsumed.push({
                     ...rawRecord,
-                    filterReason: '源记录已在历史增量中消费'
+                    filterReason: '源记录已在历史增量中消费',
+                    matchedConsumedKey
                 });
                 continue;
             }
 
-            if (checkDuplicate(dedupeKey, opTimeMsSingle, recordTypeSingle)) {
+            if (checkDuplicate(dedupeKey, opTimeMsSingle, eventKeyInfoSingle.recordType)) {
                 duplicateCount++;
                 traceData.filteredByDedup.push({
                     ...rawRecord,
-                    filterReason: getDedupFilterReason(recordTypeSingle)
+                    filterReason: getDedupFilterReason(eventKeyInfoSingle.recordType)
                 });
                 continue;
             }
             
-            addToSeenRecords(dedupeKey, opTimeMsSingle, recordTypeSingle);
+            addToSeenRecords(dedupeKey, opTimeMsSingle, eventKeyInfoSingle.recordType);
             totalProcessed++;
 
             const bucket = ensureChangeBucket(log.barcode);
             bucket.totalChange += log.stock_change.change;
             bucket.recordsCount++;
             appendSourceEvent(bucket, {
-                eventKey,
-                recordType: recordTypeSingle,
+                eventKey: eventKeyInfoSingle.primaryKey,
+                legacyEventKey: eventKeyInfoSingle.legacyKey !== eventKeyInfoSingle.primaryKey ? eventKeyInfoSingle.legacyKey : null,
+                matchKeys: eventKeyInfoSingle.matchKeys,
+                recordType: eventKeyInfoSingle.recordType,
                 barcode: rawRecord.barcode,
                 bizId: rawRecord.bizId,
                 eleBizId: rawRecord.eleBizId,

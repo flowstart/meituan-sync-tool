@@ -258,12 +258,14 @@ function listTraceLogs(baseDir, groupId, limit = 100) {
  * @param {string} barcode - 条形码
  * @param {string} sinceDate - 开始日期 (YYYY-MM-DD格式)
  * @param {number} limit - 最大返回记录数
- * @returns {Object} { rawRecords, filteredRecords, deduplicatedRecords, appliedRecords }
+ * @returns {Object} { rawRecords, filteredRecords, filteredFingerprintRecords, filteredConsumedRecords, deduplicatedRecords, appliedRecords }
  */
 function getTraceRecordsByBarcode(baseDir, groupId, barcode, sinceDate = null, limit = 1000) {
     const result = {
         rawRecords: [],           // 全部原始记录
-        filteredRecords: [],      // 被指纹过滤的记录
+        filteredRecords: [],      // 全部被过滤的记录（指纹+历史消费）
+        filteredFingerprintRecords: [], // 被指纹过滤的记录
+        filteredConsumedRecords: [], // 被历史消费账本过滤的记录
         deduplicatedRecords: [],  // 被去重的记录
         appliedRecords: []        // 实际同步的记录
     };
@@ -345,13 +347,29 @@ function getTraceRecordsByBarcode(baseDir, groupId, barcode, sinceDate = null, l
                         const filteredList = normalizeFilteredList(logData.filteredRecords?.byFingerprint, side);
                         for (const record of filteredList) {
                             if (record.barcode === barcode) {
-                                pushWithMeta(result.filteredRecords, record, {
+                                const enriched = {
                                     // filteredRecords 在现有日志里是不区分 side 的；这里尽量补上 side 方便展示
                                     side: record.side || side,
                                     syncRunId,
                                     syncTime,
                                     recordType: 'filtered'
-                                });
+                                };
+                                pushWithMeta(result.filteredRecords, record, enriched);
+                                pushWithMeta(result.filteredFingerprintRecords, record, enriched);
+                            }
+                        }
+
+                        const consumedList = normalizeFilteredList(logData.filteredRecords?.byConsumed, side);
+                        for (const record of consumedList) {
+                            if (record.barcode === barcode) {
+                                const enriched = {
+                                    side: record.side || side,
+                                    syncRunId,
+                                    syncTime,
+                                    recordType: 'filtered_consumed'
+                                };
+                                pushWithMeta(result.filteredRecords, record, enriched);
+                                pushWithMeta(result.filteredConsumedRecords, record, enriched);
                             }
                         }
 
